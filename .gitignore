@@ -1,0 +1,24 @@
+# Upstream Linux source: downloaded and verified by run.sh (the tarball is
+# ~129 MB, which GitHub refuses outright).
+/linux-*.tar.xz
+/linux-*/
+
+# Built or downloaded artifacts. run.sh and the Makefile recreate every one of
+# these, so they do not belong in the history.
+/Image
+/Image-defconfig
+/busybox.static
+/rootfs.cpio
+/rootfs.cpio.gz
+/disk.img
+
+# Packet captures from --net-dump
+*.pcap
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editors / OS
+*.swp
+.DS_Store

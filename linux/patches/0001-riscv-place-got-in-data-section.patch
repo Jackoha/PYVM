@@ -1,0 +1,29 @@
+From: pyvm <pyvm@localhost>
+Subject: [PATCH] riscv: place .got in the data section
+
+Linux 6.1's riscv vmlinux.lds.S does not place the .got section.  When the
+kernel is built with clang/lld, the GOT (used for weak symbols such as the
+kallsyms tables) is placed by orphan rules between __init_begin and
+__init_end, so it is freed by free_initmem().  Any later GOT load, e.g. in
+kallsyms during a stack trace or /proc/kallsyms, then reads recycled memory
+and hits "kernel BUG at kernel/kallsyms.c:335".
+
+Place .got explicitly after .sdata so it lives in permanent data.
+---
+--- a/arch/riscv/kernel/vmlinux.lds.S	2026-09-30 15:01:33.705504409 +0800
++++ b/arch/riscv/kernel/vmlinux.lds.S	2026-09-30 15:01:33.721216461 +0800
+@@ -122,6 +122,14 @@
+ 		*(.sdata*)
+ 	}
+ 
++	/*
++	 * Keep the GOT in the permanent data section.  Clang emits GOT loads
++	 * for weak symbols (e.g. kallsyms_*); left to the linker's orphan
++	 * placement, .got ends up inside the init area and is freed after
++	 * boot, after which those loads read recycled memory.
++	 */
++	.got : { *(.got*) }
++
+ #ifdef CONFIG_EFI
+ 	.pecoff_edata_padding : { BYTE(0); . = ALIGN(PECOFF_FILE_ALIGNMENT); }
+ 	__pecoff_data_raw_size = ABSOLUTE(. - __pecoff_text_end);
