@@ -227,6 +227,32 @@ pyvm:~# apk add jq git python3 build-base
 built for riscv64. Because the image is an ext4 disk, anything you install
 **stays installed** across reboots.
 
+#### `apk` is slow, and interrupting it causes a confusing error
+
+Installing a package takes **minutes**, not seconds: `apk add sl` measured 367 s,
+`apk update` 416 s. Pass `--no-progress`, because the progress bar writes
+constantly to the emulated serial console and console I/O is one of the more
+expensive things this VM does.
+
+The trap is that `apk` looks hung, so you interrupt it and try again, and the
+first one has not finished letting go of its lock:
+
+```
+# apk add sl
+ERROR: Unable to lock database: temporary error (try again later)
+ERROR: Failed to open apk database: temporary error (try again later)
+```
+
+"temporary error (try again later)" is apk's own wording for `EAGAIN`, here from
+`flock()` on `/lib/apk/db/lock`. Check with `ps | grep apk` and either wait for
+it or `kill` it; the kernel drops the lock when the process exits, so there is
+no stale lock to clean up. Deleting `/lib/apk/db/lock` is only worth trying if
+`ps` shows nothing and it still fails.
+
+Do not stop the VM in the middle of an `apk` transaction (especially not with
+Ctrl-A X, which does not flush) — that can leave the package database
+half-written.
+
 #### HTTPS works, but verifying a certificate is slow
 
 Expect TLS to be the slowest thing the guest does. Verifying a certificate
