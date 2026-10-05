@@ -29,6 +29,11 @@ class VirtioBlock(VirtioMMIO):
 
     def close(self):
         if self.fd >= 0:
+            if not self.readonly:
+                try:
+                    os.fsync(self.fd)       # the guest's writes reach the real disk
+                except OSError:
+                    pass
             os.close(self.fd)
             self.fd = -1
 

@@ -123,6 +123,61 @@ directory already has it applied.
 
 **Prebuilt Image:** just pass it with `-k`.
 
+## Keeping your files
+
+pyvm can boot two different roots, and they behave very differently:
+
+| | | |
+|---|---|---|
+| `./run.sh` | `rootfs.cpio` as an **initramfs** | lives in RAM — **everything you write is gone at poweroff** |
+| `./run.sh --disk` | `disk.img`, a 64 MiB ext4 image | a real file on the host — **your changes are still there next boot** |
+
+So if you want the VM to remember what you did, boot with the disk:
+
+```sh
+./run.sh --disk            # or: make run-disk
+                           # or: python3 -m pyvm -k Image -d disk.img
+```
+
+The guest says which one it got, right under the welcome banner:
+
+```
+Storage: /dev/root - changes are saved
+Storage: initramfs (RAM) - changes are LOST at poweroff; boot with --disk to keep them
+```
+
+(`/proc/mounts` calls a `root=`-mounted device `/dev/root`; it is `/dev/vda`,
+the disk image.)
+
+Anything you do then survives — new files, installed binaries, edited configs,
+shell history:
+
+```
+root@pyvm:~# echo "my notes" > /root/notes.txt
+root@pyvm:~# poweroff -f
+$ ./run.sh --disk
+root@pyvm:~# cat /root/notes.txt
+my notes
+```
+
+`poweroff -f`, `poweroff` and `exit` all flush the filesystem before stopping, so
+they are safe. **Ctrl-A X is not** — it pulls the virtual power cord, and
+whatever Linux still had in its page cache is lost. Use it only to escape a
+wedged guest, and type `sync` first if you have just written something you care
+about. `tests/persist.py` checks all three.
+
+`--disk-ro` attaches the image read-only when you want a throwaway session that
+cannot alter it, and `tools/mkrootfs.py --ext4 disk.img --size 256` makes a
+bigger one. Note that `disk.img` is in `.gitignore`, so files you create inside
+the guest stay on your machine and are not pushed to GitHub.
+
+To change a file *on* `disk.img` from the host, either boot the VM and edit it
+in the guest, or rebuild the image with `tools/mkrootfs.py` (pass `--dir DIR` to
+graft in files you want to keep). Do **not** patch a used image with `debugfs`:
+once the guest has mounted it, ext4's journal can replay over edits made behind
+its back, silently undoing them. `mkrootfs.py` only uses `debugfs` on an image
+it has just created, whose journal is still empty.
+
 ## Networking
 
 The guest gets a virtio-net NIC (`eth0`). Two backends drive it, chosen with
@@ -321,6 +376,10 @@ python3 tests/boot_linux.py --kernel Image --initrd rootfs.cpio --net --net-exte
 
 # the network stack on its own, against a fake guest: no kernel, runs in a second
 python3 tests/test_net.py -v        # 10/10 pass, incl. 256 KiB TCP both ways
+
+# persistence: write a file, stop the VM three different ways, boot again and
+# look for it (says which ways of exiting are safe)
+python3 tests/persist.py --kernel Image --disk disk.img
 ```
 
 ## Source layout
@@ -349,7 +408,8 @@ tools/
   build_linux.sh  build a kernel Image for pyvm   (run.sh drives all of tools/)
   get_busybox.py  download a static riscv64 busybox
   mkrootfs.py     make an initramfs (pure Python cpio) and/or ext4 disk image
-tests/            riscv-tests runner, Linux boot test, network stack test
+tests/            riscv-tests runner, Linux boot test, network stack test,
+                  disk persistence test
 ```
 
 ## Limitations

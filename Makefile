@@ -10,6 +10,7 @@
 #   make test                         boot, run shell checks, power off (headless)
 #   make test-net                     the same, plus the network checks
 #   make test-slirp                   test the network stack alone (no kernel needed)
+#   make test-persist                 check the disk keeps files across a reboot
 
 PYTHON  ?= python3
 LINUX   ?= linux-6.1.74
@@ -18,7 +19,7 @@ MEM     ?= 128
 IMAGE   ?= Image
 NET     ?= user
 
-.PHONY: busybox rootfs kernel run run-disk test test-net test-slirp
+.PHONY: busybox rootfs kernel run run-disk test test-net test-slirp test-persist
 
 busybox: busybox.static
 busybox.static:
@@ -45,3 +46,6 @@ test-net: $(IMAGE) rootfs.cpio
 
 test-slirp:
 	$(PYTHON) tests/test_net.py
+
+test-persist: $(IMAGE) disk.img
+	$(PYTHON) tests/persist.py --kernel $(IMAGE) --disk disk.img --mem $(MEM)

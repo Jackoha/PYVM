@@ -52,10 +52,18 @@ if [ -d /sys/class/net/eth0 ]; then
 else
     net="none"
 fi
+# Say plainly whether files written here will still be here next boot: an
+# initramfs root lives in RAM, a /dev/vda root is the disk image on the host.
+rootdev=$(awk '$2 == "/" { print $1; exit }' /proc/mounts)
+case "$rootdev" in
+    /dev/*) store="$rootdev - changes are saved" ;;
+    *)      store="initramfs (RAM) - changes are LOST at poweroff; boot with --disk to keep them" ;;
+esac
 echo
 echo "Welcome to Linux on pyvm (RISC-V RV64GC emulated in Python)"
 uname -a
 echo "Network: $net"
+echo "Storage: $store"
 echo "Type 'exit' or 'poweroff' to shut down."
 # Run the shell on the real console device so it gets a controlling tty (job
 # control, Ctrl-C).  It runs as a child: this script is PID 1, and PID 1 must
