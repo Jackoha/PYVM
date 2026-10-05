@@ -11,6 +11,8 @@
 /rootfs.cpio
 /rootfs.cpio.gz
 /disk.img
+/alpine.img
+/alpine.cpio
 
 # Packet captures from --net-dump
 *.pcap

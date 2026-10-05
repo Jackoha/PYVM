@@ -37,6 +37,11 @@ CHECKS = [
     ('echo bg-job & wait; echo fg-done', 'fg-done'),                          # job control
     ('ls /proc/self/ | grep -c status', '1'),
     ('cat /sys/class/rtc/rtc0/name', 'goldfish'),
+    # The board has no hardware RNG, so pyvm seeds the kernel through the device
+    # tree.  If that regresses, the CRNG never initialises and anything calling
+    # getrandom() -- OpenSSL, so curl and ssh -- hangs forever with no output.
+    ('test $(cat /proc/sys/kernel/random/entropy_avail) -ge 256 && echo seeded', 'seeded'),
+    ('head -c 16 /dev/random >/dev/null && echo random-ok', 'random-ok'),
     # kallsyms still works after init memory is freed (skipped if not configured)
     ('if [ -e /proc/kallsyms ]; then head -n 3 /proc/kallsyms | wc -l; else echo 3; fi', '3'),
 ]

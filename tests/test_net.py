@@ -462,6 +462,34 @@ def t_hostfwd(s, g):
     log('host -> guest on forwarded port %d, reply %r' % (s.fwd_port, result['data']))
 
 
+@test('DNS over TCP is forwarded to the real resolver')
+def t_tcp_dns(s, g):
+    # Resolvers fall back to TCP when a reply will not fit in a datagram.  Point
+    # the stack at a local stand-in resolver and check a TCP connection to the
+    # virtual DNS address reaches it, rather than the literal 10.0.2.3.
+    srv = EchoServer()
+    r = Slirp(dnsserver='127.0.0.1')
+    r.resolvers = ['127.0.0.1']
+    r.dns_ip = frame.ip2b('10.0.2.3')
+    r.start()
+    rg = FakeGuest(r)
+    try:
+        # the stand-in listens on an ephemeral port, so aim port 53 at it
+        real = r._l4_target
+        r._l4_target = lambda dst, dport: (('127.0.0.1', srv.port)
+                                           if dst == r.dns_ip and dport == 53
+                                           else real(dst, dport))
+        c = GuestTcp(rg, 45003, r.dns_ip, 53)
+        rg.conns[c.key()] = c
+        c.connect()
+        c.write(b'\x00\x1dquery-over-tcp')
+        rg.wait(lambda: c.data.endswith(b'query-over-tcp'), 'the forwarded TCP query')
+        log('TCP :53 to %s reached the resolver and echoed back'
+            % frame.b2ip(r.dns_ip))
+    finally:
+        r.close()
+
+
 @test('restrict=on blocks the outside but not DHCP')
 def t_restrict(s, g):
     r = Slirp(restrict=True)

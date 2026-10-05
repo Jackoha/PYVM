@@ -106,7 +106,31 @@ CONFIG_DEVTMPFS=y  CONFIG_PROC_FS=y  CONFIG_SYSFS=y  CONFIG_TTY=y
 CONFIG_VIRTIO_MMIO=y  CONFIG_VIRTIO_BLK=y  CONFIG_EXT4_FS=y     # for --disk
 CONFIG_NET=y  CONFIG_INET=y  CONFIG_PACKET=y                    # for --net
 CONFIG_NETDEVICES=y  CONFIG_VIRTIO_NET=y                        # (PACKET: udhcpc)
+CONFIG_RANDOM_TRUST_BOOTLOADER=y                                # entropy, see below
 ```
+
+**Entropy, and why TLS hangs without it.** This board has no hardware random
+number generator — no `virtio-rng`, no CPU instruction (Zkr is not emulated).
+Linux therefore has nothing to seed `/dev/random` from, its CRNG never finishes
+initialising, and **every call to `getrandom()` blocks forever**. Programs that
+avoid it (busybox `wget`, `nslookup`) work fine, which makes the failure
+confusing: `curl --version` prints happily, while `curl https://...` hangs
+without a single byte of output, because OpenSSL seeds its RNG at startup.
+
+pyvm fixes this the way a real bootloader does: it puts 64 bytes from the host's
+`os.urandom()` into the device tree as `/chosen/rng-seed`, which Linux mixes in
+during `parse_dtb()`. The kernel only *credits* that seed as entropy when
+`CONFIG_RANDOM_TRUST_BOOTLOADER=y`, so that option is required — it is in
+[`linux/pyvm.config`](linux/pyvm.config).
+
+Its Kconfig default is `y`, so a stock `defconfig` kernel already has it; only
+`make tinyconfig` switches it off, which is why pyvm's fragment sets it back.
+
+Note that the `random.trust_bootloader=1` **command-line parameter does not
+help**, however plausible it looks. It is an `early_param`, and `setup_arch()`
+calls `parse_dtb()` (which mixes the seed) before `parse_early_param()` (which
+would parse the flag), so the seed has already been discarded as untrusted by
+the time the parameter is read. The config option is the only way.
 
 Keep `CONFIG_SMP` single-hart friendly (any `NR_CPUS` works; there is one
 hart), and do **not** rely on Svpbmt/Zicbom/Sstc/V/H — they are not
@@ -177,6 +201,82 @@ graft in files you want to keep). Do **not** patch a used image with `debugfs`:
 once the guest has mounted it, ext4's journal can replay over edits made behind
 its back, silently undoing them. `mkrootfs.py` only uses `debugfs` on an image
 it has just created, whose journal is still empty.
+
+## Installing software: `curl`, `apk` and friends
+
+The busybox root filesystem is deliberately tiny: one static binary, no compiler,
+no package manager, and `curl: not found` (busybox provides `wget` instead).
+When you want real programs, boot the **Alpine Linux** image instead. It is the
+same kernel and the same VM, just a userland with a package manager:
+
+```sh
+./run.sh --alpine          # builds alpine.img the first time, then boots it
+                           # or: make alpine && make run-alpine
+```
+
+`curl` and the CA certificates are already installed, and `apk` works against
+Alpine's real repositories over the network pyvm provides:
+
+```
+pyvm:~# curl -sI https://www.alpinelinux.org/ | head -1
+pyvm:~# apk update
+pyvm:~# apk add jq git python3 build-base
+```
+
+`apk update` reports about 22,000 packages across `main` and `community`, all
+built for riscv64. Because the image is an ext4 disk, anything you install
+**stays installed** across reboots.
+
+#### HTTPS works, but verifying a certificate is slow
+
+Expect TLS to be the slowest thing the guest does. Verifying a certificate
+chain means parsing a 217 KiB trust store and doing public-key maths, which at a
+few MIPS takes **tens of seconds**:
+
+```
+curl http://example.com/                 -> 200 in   2 s
+curl https://dl-cdn.alpinelinux.org/     -> 200 in  29 s
+curl -k https://example.com/             -> 200 in   9 s   (verification skipped)
+curl https://example.com/                -> fails
+```
+
+The last line is not a pyvm bug — the handshake and the verification both work.
+The problem is that some servers, Cloudflare among them, close an idle
+connection after about ten seconds, which is less than the guest needs. A
+capture shows the guest acknowledging the certificate, the server sending FIN
+while the guest is still doing the maths, and curl then reporting
+`Send failure: Broken pipe`. Against a more patient server the same request
+succeeds. If you hit it, `-k` skips verification, `--cacert` with a trimmed
+bundle cuts the parsing cost, and plain HTTP is unaffected.
+
+### Baking packages into the image
+
+Installing inside the guest is slow — the VM runs at a few MIPS, so unpacking a
+large package takes a while. `tools/mkalpine.py` can instead unpack packages on
+the host at build time, so they are present on the very first boot and need no
+network:
+
+```sh
+python3 tools/mkalpine.py --ext4 alpine.img --size 512 \
+    --pkg curl --pkg jq --pkg python3
+```
+
+It reads Alpine's `APKINDEX`, resolves dependencies itself (`curl` alone pulls in
+17 packages), verifies the root filesystem tarball against its published
+sha256, and unpacks everything into the image. `--no-pkg` gives bare Alpine,
+`--cpio` writes an initramfs instead of a disk, and `--dir DIR` grafts in files
+of your own.
+
+| | busybox (`disk.img`) | Alpine (`alpine.img`) |
+|---|---|---|
+| size | 64 MiB image, ~2 MiB used | 512 MiB image, ~30 MiB used |
+| boot | fastest | a little slower |
+| userland | one static busybox | musl, busybox, `apk` |
+| packages | none | `apk add` anything in Alpine's riscv64 repos |
+
+Both are ordinary pyvm disks, so `--disk-ro`, `--net` and everything else work
+the same way. Neither image is in git (`.gitignore`); `run.sh` and
+`tools/mkalpine.py` rebuild them.
 
 ## Networking
 
@@ -408,6 +508,8 @@ tools/
   build_linux.sh  build a kernel Image for pyvm   (run.sh drives all of tools/)
   get_busybox.py  download a static riscv64 busybox
   mkrootfs.py     make an initramfs (pure Python cpio) and/or ext4 disk image
+  mkalpine.py     build an Alpine riscv64 root filesystem with apk and curl,
+                  resolving .apk dependencies from APKINDEX itself
 tests/            riscv-tests runner, Linux boot test, network stack test,
                   disk persistence test
 ```

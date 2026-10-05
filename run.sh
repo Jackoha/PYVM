@@ -3,6 +3,7 @@
 #
 #   ./run.sh                  build what is missing, boot with the initramfs
 #   ./run.sh --disk           boot with disk.img (ext4) as the root filesystem
+#   ./run.sh --alpine         boot Alpine Linux (alpine.img) -- has curl and apk
 #   ./run.sh --defconfig      use a stock-defconfig kernel (Image-defconfig) instead
 #   ./run.sh --rebuild        rebuild the kernel even if an Image already exists
 #   ./run.sh --build-only     build everything, do not boot
@@ -45,6 +46,7 @@ usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --disk)       BOOT=disk ;;
+        --alpine)     BOOT=alpine ;;
         --defconfig)  CONFIG=defconfig ;;
         --rebuild)    REBUILD=1 ;;
         --build-only) RUN=0 ;;
@@ -159,16 +161,28 @@ else
     step "Disk: disk.img (present, kept as is)"
 fi
 
+# ---------------------------------------------------------------- 4b. Alpine
+if [ "$BOOT" = alpine ] && [ ! -f alpine.img ]; then
+    if command -v mke2fs >/dev/null 2>&1 || [ -x /sbin/mke2fs ]; then
+        step "Building alpine.img (Alpine Linux with apk and curl, ~30 MiB used)"
+        "$PYTHON" tools/mkalpine.py --ext4 alpine.img --size 512
+    else
+        die "mke2fs (e2fsprogs) is needed to create alpine.img"
+    fi
+elif [ "$BOOT" = alpine ]; then
+    step "Alpine disk: alpine.img (present, kept as is)"
+fi
+
 # ---------------------------------------------------------------- 5. boot
 if [ $RUN = 0 ]; then
     step "Everything is built.  Boot with: ./run.sh"
     exit 0
 fi
-if [ "$BOOT" = disk ]; then
-    ARGS=(-k "$IMAGE" -d disk.img)
-else
-    ARGS=(-k "$IMAGE" -i rootfs.cpio)
-fi
+case "$BOOT" in
+    disk)   ARGS=(-k "$IMAGE" -d disk.img) ;;
+    alpine) ARGS=(-k "$IMAGE" -d alpine.img); [ "$MEM" -lt 256 ] && MEM=256 ;;
+    *)      ARGS=(-k "$IMAGE" -i rootfs.cpio) ;;
+esac
 [ "$CONFIG" = defconfig ] && [ "$MEM" -lt 256 ] && MEM=256
 if [ -n "$FWD" ]; then
     case "$NET" in

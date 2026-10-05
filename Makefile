@@ -6,6 +6,8 @@
 #   make kernel LINUX=../linux-6.1.74 build Image from your Linux source tree
 #   make run                          boot Image + rootfs.cpio
 #   make run-disk                     boot Image with disk.img as the root filesystem
+#   make alpine                       build alpine.img (Alpine Linux: apk, curl)
+#   make run-alpine                   boot Alpine (a package manager in the guest)
 #   make run NET='user,hostfwd=tcp::8080-:80'   boot with a host port forwarded in
 #   make test                         boot, run shell checks, power off (headless)
 #   make test-net                     the same, plus the network checks
@@ -19,7 +21,8 @@ MEM     ?= 128
 IMAGE   ?= Image
 NET     ?= user
 
-.PHONY: busybox rootfs kernel run run-disk test test-net test-slirp test-persist
+.PHONY: busybox rootfs kernel alpine run run-disk run-alpine test test-net \
+	test-slirp test-persist
 
 busybox: busybox.static
 busybox.static:
@@ -32,11 +35,18 @@ rootfs.cpio disk.img: busybox.static tools/mkrootfs.py
 kernel:
 	tools/build_linux.sh $(LINUX) $(CONFIG) $(abspath $(IMAGE))
 
+alpine: alpine.img
+alpine.img: tools/mkalpine.py tools/mkrootfs.py
+	$(PYTHON) tools/mkalpine.py --ext4 $@ --size 512
+
 run: $(IMAGE) rootfs.cpio
 	$(PYTHON) -m pyvm -k $(IMAGE) -i rootfs.cpio -m $(MEM) --net $(NET)
 
 run-disk: $(IMAGE) disk.img
 	$(PYTHON) -m pyvm -k $(IMAGE) -d disk.img -m $(MEM) --net $(NET)
+
+run-alpine: $(IMAGE) alpine.img
+	$(PYTHON) -m pyvm -k $(IMAGE) -d alpine.img -m 256 --net $(NET)
 
 test: $(IMAGE) rootfs.cpio
 	$(PYTHON) tests/boot_linux.py --kernel $(IMAGE) --initrd rootfs.cpio --mem $(MEM)

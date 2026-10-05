@@ -13,6 +13,7 @@ Memory map (same layout as QEMU's `virt` machine, so stock kernels just work):
 """
 
 import mmap
+import os
 import struct
 import time
 
@@ -124,6 +125,13 @@ class Machine:
 
         ch = root.child('chosen')
         ch.prop('bootargs', bootargs)
+        # Seed the kernel's RNG the way a real bootloader does.  Without this
+        # there is no entropy source on this board at all, the CRNG never
+        # initialises, and anything calling getrandom() -- OpenSSL, and so
+        # curl, ssh, python's secrets -- blocks forever.  Linux credits the
+        # seed only when it trusts the bootloader, hence CONFIG_RANDOM_TRUST_
+        # BOOTLOADER or random.trust_bootloader=1 on the command line.
+        ch.prop('rng-seed', os.urandom(64))
         ch.prop('stdout-path', '/soc/serial@%x' % UART_BASE)
         if initrd:
             ch.prop('linux,initrd-start', fdt.u64(initrd[0]))

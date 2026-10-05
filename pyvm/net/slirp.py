@@ -695,6 +695,22 @@ class Slirp:
             return '127.0.0.1'                          # 10.0.2.2 means "the host"
         return frame.b2ip(ip)
 
+    def _l4_target(self, dst, dport):
+        """Where a guest TCP/UDP flow to dst:dport really goes, or None to refuse.
+
+        The virtual DNS address is a stand-in for the host's own resolvers, and
+        that has to hold for TCP as well as UDP: resolvers fall back to TCP when
+        a reply does not fit in a datagram, and connecting to the literal
+        10.0.2.3 would just hang."""
+        if dst == self.dns_ip:
+            if dport != 53:
+                return None
+            self._dns_rr += 1
+            return (self.resolvers[self._dns_rr % len(self.resolvers)], 53)
+        if not self._reachable(dst):
+            return None
+        return (self._target(dst), dport)
+
     def _reachable(self, ip):
         if ip in (self.bcast_ip, frame.BCAST_IP, frame.ANY_IP) or ip[0] >= 224:
             return False
@@ -712,17 +728,10 @@ class Slirp:
         c = self.udp.get(key)
         if c is not None:
             return c.send(data)
-        if dst == self.dns_ip:
-            if dport != 53:
-                return
-            self._dns_rr += 1
-            target = (self.resolvers[self._dns_rr % len(self.resolvers)], 53)
-            idle = DNS_IDLE
-        elif self._reachable(dst):
-            target = (self._target(dst), dport)
-            idle = UDP_IDLE
-        else:
+        target = self._l4_target(dst, dport)
+        if target is None:
             return
+        idle = DNS_IDLE if dst == self.dns_ip else UDP_IDLE
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setblocking(False)
@@ -802,12 +811,13 @@ class Slirp:
             return
         if (flags & (TH_SYN | TH_ACK)) != TH_SYN:
             return self._rst(key, seq, ack, flags, len(data))
-        if not self._reachable(dst):
+        target = self._l4_target(dst, dport)
+        if target is None:
             return self._rst(key, seq, ack, flags, len(data))
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setblocking(False)
-            err = sock.connect_ex((self._target(dst), dport))
+            err = sock.connect_ex(target)
         except OSError:
             return self._rst(key, seq, ack, flags, len(data))
         if err not in (0, errno.EINPROGRESS, errno.EALREADY, errno.EWOULDBLOCK):
