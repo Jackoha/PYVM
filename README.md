@@ -1,3 +1,5 @@
+> this is just a vibe project. thank you claude.
+
 # pyvm — a RISC-V virtual machine in Python that boots Linux
 
 pyvm is a full-system emulator written in pure Python (no C extensions, no
