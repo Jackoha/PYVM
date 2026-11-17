@@ -537,7 +537,7 @@ Measured on one core of the development machine:
 
 | Workload (Linux 6.1.74, busybox initramfs) | CPython 3.13 |
 |---|---|
-| tiny config (`tools/build_linux.sh`) → shell prompt | **~14 s** (~50 M instructions) |
+| tiny config (`tools/build_linux.sh`) → shell prompt | **~11 s** (~47 M instructions) |
 | the same, with `--net user` configured by DHCP | **~14 s** (the NIC costs nothing to boot) |
 | stock `defconfig` → shell prompt | ~33 s (~110 M instructions) |
 | average speed while booting | ~3.6–4.5 MIPS |
@@ -561,6 +561,54 @@ How it gets there:
 - stores into pages holding decoded code take a slow path that invalidates only
   the affected handlers, so self-modifying code and DMA stay coherent.
 
+### Where a boot's instructions go
+
+`tests/boot_phases.py` reports the instruction count as the guest passes
+landmarks in its own console output.  Instruction counts repeat to about
+0.02% between runs, so they are the honest way to compare two images; wall
+time on a loaded host is not.
+
+```sh
+python3 tests/boot_phases.py --kernel Image --initrd rootfs.cpio --repeat 2
+python3 tests/boot_phases.py --kernel Image --disk disk.img
+```
+
+Most of a boot is the kernel: of the ~47 M instructions to the prompt with the
+busybox initramfs, ~34 M happen before `/init` runs, and ~26 M of those are
+unpacking the 1 MB initramfs into a ramfs.  Userspace is the remaining ~7 M.
+
+One thing in there was worth fixing.  busybox is a single binary that decides
+what to be from `argv[0]`, so it needs ~300 symlinks (`/bin/ls`,
+`/usr/bin/awk`, …) pointing at it, and the init script used to make them at
+every boot with `busybox --install -s`.  `tools/mkrootfs.py` now bakes them
+into the image at build time instead, reading busybox's own applet table out
+of the binary (see `busybox_applets()`), so the guest does not have to:
+
+| root filesystem | before | after | |
+|---|---|---|---|
+| ext4 disk, first boot | 73.4 M | **43.0 M** | −41% |
+| initramfs, every boot | 48.6 M | **46.5 M** | −4.3% |
+
+The disk gains far more because each symlink there is a journalled ext4
+metadata write through the emulated virtio-blk device — 30.6 M instructions
+for the 303 links, against 6.3 M for the same links in a ramfs.  An initramfs
+gives most of its saving back, because the kernel then has 303 more cpio
+entries to unpack (4.2 M), but what is left applies to every boot, while a
+disk only ever paid on its first one.
+
+Two other shapes were measured and rejected: cpio **hardlinks** instead of
+symlinks are worse than changing nothing (50.9 M — the kernel links *and*
+opens each entry), and making **no links at all** does not work, because this
+busybox is built without a standalone shell, so without links even `mount` is
+not found and `/init` dies.
+
+The links are still identical to what the guest used to make: the names and
+directories read out of the binary match, one for one, the 305 links a real
+`busybox --install -s` left behind.  The init script keeps its
+`[ -e /bin/ls ] || busybox --install -s` guard, so an image built with
+`--no-applets`, or from a busybox whose table `mkrootfs` cannot read, still
+works the old way.
+
 ## Testing
 
 ```sh
@@ -582,6 +630,16 @@ python3 tests/test_net.py -v        # 10/10 pass, incl. 256 KiB TCP both ways
 # persistence: write a file, stop the VM three different ways, boot again and
 # look for it (says which ways of exiting are safe)
 python3 tests/persist.py --kernel Image --disk disk.img
+
+# the boot menu, against a fake curses window: drawing, keys, the argv it builds
+python3 tests/test_launcher.py
+
+# busybox's applet table: that mkrootfs can still read it out of the binary,
+# that it refuses to guess, and that the links land in the image
+python3 tests/test_applets.py
+
+# where a boot spends its instructions (use this to check an optimisation)
+python3 tests/boot_phases.py --kernel Image --initrd rootfs.cpio --repeat 2
 ```
 
 ## Source layout

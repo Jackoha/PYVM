@@ -22,6 +22,7 @@ provides them.
 import argparse
 import gzip
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -30,6 +31,10 @@ import tempfile
 
 INIT_SCRIPT = r'''#!/bin/busybox sh
 /bin/busybox mkdir -p /proc /sys /dev /tmp /run /root /mnt /sbin /usr/bin /usr/sbin
+# mkrootfs bakes busybox's applet links into the image, so this line is only
+# a fallback: it runs when they are missing (a hand-built root, or a busybox
+# whose applet table mkrootfs could not read).  Doing it here instead costs
+# 6.3 M emulated instructions on an initramfs, and 30.6 M on a disk root.
 [ -e /bin/ls ] || /bin/busybox --install -s
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
@@ -123,6 +128,114 @@ HOSTS = b"""127.0.0.1\tlocalhost
 DIRS = ('bin', 'sbin', 'dev', 'etc', 'proc', 'sys', 'tmp', 'root', 'mnt', 'run',
         'usr', 'usr/bin', 'usr/sbin', 'usr/share', 'usr/share/udhcpc')
 
+# ------------------------------------------------------------------ applets
+# `busybox --install -s` makes one symlink per applet at boot: 303 symlink()
+# calls plus a fork and exec of busybox.  busybox carries the same table it
+# walks inside the binary, so the links can be made out here instead, once,
+# while the image is built.  Measured with tests/boot_phases.py (RV64GC,
+# 128 MiB, instructions to the shell prompt):
+#
+#   ext4 disk root, first boot   73.4 M -> 43.0 M   -41%
+#   initramfs, every boot        48.6 M -> 46.5 M   -4.3%
+#
+# The disk saves so much more because each symlink is a journalled ext4
+# metadata write through the emulated virtio-blk device: 30.6 M instructions
+# for the 303 links, against 6.3 M for the same links in a ramfs.  The
+# initramfs then gives most of that back -- the kernel has to unpack 303 more
+# cpio entries, 4.2 M -- so its net win is small but applies to every boot,
+# while the disk only pays on the first one (after that the links are on it).
+#
+# Hardlinks were tried instead and are worse than doing nothing: 50.9 M,
+# because the kernel links *and* opens each entry while unpacking.
+APPLET_DIRS = ('', 'bin', 'sbin', 'usr/bin', 'usr/sbin')
+
+# Applets whose install directory busybox has not moved in many years.  They
+# pick out which of the nibble arrays in .rodata is applet_install_loc, and
+# double as a check that the parse means what we think it does.
+APPLET_PROBES = {'sh': 1, 'ls': 1, 'cat': 1, 'mount': 1, 'mkdir': 1, 'echo': 1,
+                 'init': 2, 'ifconfig': 2, 'route': 2, 'halt': 2, 'reboot': 2}
+
+# Without these the init script cannot reach a shell prompt, so a parse that
+# does not contain every one of them is treated as a failed parse.
+APPLET_NEEDED = ('sh', 'ash', 'ls', 'cat', 'echo', 'mkdir', 'mount', 'hostname',
+                 'uname', 'sed', 'awk', 'ifconfig', 'route', 'ip', 'udhcpc',
+                 'setsid', 'sync', 'poweroff', 'reboot', 'test')
+
+APPLET_NAME = re.compile(r'[\w.\[-]{1,24}\Z')
+
+
+def _nibble(blob, base, i):
+    """applet_install_loc is two applets per byte, low nibble first."""
+    byte = blob[base + i // 2]
+    return (byte >> 4) if (i & 1) else (byte & 0xf)
+
+
+def busybox_applets(blob):
+    """Read busybox's applet table out of the binary: [(dir, name), ...].
+
+    busybox keeps the applet names in .rodata as one NUL-separated blob, and
+    the directory each applet installs into in a parallel array of nibbles
+    (libbb/appletlib.c: APPLET_INSTALL_LOC, install_dir[]).  Neither is a
+    symbol we can look up in a stripped static binary, so they are found by
+    shape: the names start with the two applets that sort first, "[" and
+    "[[", and the array is the one run of nibbles, none larger than 4, that
+    puts every probe applet in the directory it is known to install into.
+
+    Returns [] -- never a guess -- if anything is not as expected; the caller
+    then leaves the job to `busybox --install -s` in the guest.
+    """
+    start = blob.find(b'[\x00[[\x00')
+    end = blob.find(b'\x00\x00', start) if start >= 0 else -1
+    if end < 0:
+        return []
+    names = [n.decode('ascii', 'replace') for n in blob[start:end].split(b'\x00')]
+    if not 50 <= len(names) <= 2000 or not all(APPLET_NAME.match(n) for n in names):
+        return []
+    index = {n: i for i, n in enumerate(names)}
+    probes = [(index[n], d) for n, d in APPLET_PROBES.items() if n in index]
+    if len(probes) < 6:
+        return []
+
+    # Candidate positions: runs of bytes whose both nibbles are a valid
+    # directory index, long enough to hold the whole array.
+    need = (len(names) + 1) // 2
+    cls = ''.join('\\x%02x' % c for c in range(256)
+                  if (c & 0xf) < len(APPLET_DIRS) and (c >> 4) < len(APPLET_DIRS))
+    found = None
+    for run in re.finditer(('[%s]{%d,}' % (cls, need)).encode(), blob):
+        for base in range(run.start(), run.end() - need + 1):
+            if all(_nibble(blob, base, i) == d for i, d in probes):
+                if found is not None:
+                    return []                 # ambiguous: do not pick one
+                found = base
+    if found is None:
+        return []
+    return [(APPLET_DIRS[_nibble(blob, found, i)], n) for i, n in enumerate(names)]
+
+
+def add_applets(w, blob, made):
+    """Pre-make the applet symlinks, skipping paths populate() already wrote.
+
+    Returns the number of links created, 0 when the table could not be read.
+    """
+    applets = busybox_applets(blob)
+    missing = [n for n in APPLET_NEEDED if n not in {name for _, name in applets}]
+    if not applets or missing:
+        why = ('is missing %s' % ', '.join(missing)) if applets else 'could not be read'
+        sys.stderr.write("mkrootfs: busybox's applet table %s; the guest will run "
+                         "`busybox --install -s` at boot instead\n" % why)
+        return 0
+    for d in sorted({d for d, _ in applets} - set(DIRS) - {''}):
+        w.dir(d)
+    n = 0
+    for d, name in applets:
+        path = os.path.normpath(os.path.join(d, name))
+        if path in made:
+            continue
+        w.symlink(path, '/bin/busybox')
+        n += 1
+    return n
+
 
 # ---------------------------------------------------------------------- cpio
 class CpioWriter:
@@ -210,7 +323,8 @@ def populate(w, a):
     w.chardev('dev/null', 1, 3, 0o666)
     if a.busybox:
         with open(a.busybox, 'rb') as f:
-            w.file('bin/busybox', f.read(), 0o755)
+            blob = f.read()
+        w.file('bin/busybox', blob, 0o755)
         w.symlink('bin/sh', 'busybox')
         init = INIT_SCRIPT
         if a.init:
@@ -224,6 +338,12 @@ def populate(w, a):
         w.file('etc/hosts', HOSTS)
         w.file('etc/resolv.conf', RESOLV_CONF)
         w.file('usr/share/udhcpc/default.script', UDHCPC_SCRIPT.encode(), 0o755)
+        if not a.no_applets:
+            # after the files above, so none of them is overwritten by an
+            # applet of the same name -- in particular /sbin/init, which is
+            # the disk root's entry point and also a busybox applet.
+            made = {'bin/busybox', 'bin/sh', 'init', 'sbin/init'}
+            a.applets_made = add_applets(w, blob, made)
     for d in a.dir:
         add_tree(w, d)
 
@@ -244,16 +364,25 @@ def chown_root(image, tree):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def applet_note(a):
+    return ', %d busybox applet links' % a.applets_made if a.applets_made else ''
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--busybox', help='statically linked riscv64 busybox (see tools/get_busybox.py)')
     p.add_argument('--init', help='custom init script (default: start a busybox shell)')
     p.add_argument('--dir', action='append', default=[], help='extra directory tree to add (repeatable)')
+    p.add_argument('--no-applets', action='store_true',
+                   help="do not pre-make busybox's applet links; let the guest run"
+                        ' `busybox --install -s` at boot instead (which costs it'
+                        ' 6.3 M instructions on an initramfs, 30.6 M on a disk)')
     p.add_argument('--cpio', metavar='FILE', help='write an initramfs (newc cpio)')
     p.add_argument('--gzip', action='store_true', help='gzip the initramfs')
     p.add_argument('--ext4', metavar='FILE', help='write an ext4 disk image (needs mke2fs)')
     p.add_argument('--size', type=int, default=64, help='ext4 image size in MiB (default 64)')
     a = p.parse_args()
+    a.applets_made = 0
     if not (a.busybox or a.dir):
         p.error('need --busybox and/or --dir')
     if not (a.cpio or a.ext4):
@@ -267,7 +396,7 @@ def main():
             data = gzip.compress(data, 9)
         with open(a.cpio, 'wb') as f:
             f.write(data)
-        print('wrote %s (%d KiB)' % (a.cpio, len(data) >> 10))
+        print('wrote %s (%d KiB%s)' % (a.cpio, len(data) >> 10, applet_note(a)))
 
     if a.ext4:
         mke2fs = shutil.which('mke2fs') or '/sbin/mke2fs'
@@ -281,7 +410,7 @@ def main():
             chown_root(a.ext4, tmp)
         finally:
             shutil.rmtree(tmp)
-        print('wrote %s (%d MiB ext4)' % (a.ext4, a.size))
+        print('wrote %s (%d MiB ext4%s)' % (a.ext4, a.size, applet_note(a)))
 
 
 if __name__ == '__main__':
