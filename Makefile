@@ -7,6 +7,8 @@
 #   make run                          boot Image + rootfs.cpio
 #   make run-disk                     boot Image with disk.img as the root filesystem
 #   make alpine                       build alpine.img (Alpine Linux: apk, curl)
+#   make apk PKG="htop jq"            install packages into alpine.img from the HOST
+#                                     (seconds, instead of minutes inside the VM)
 #   make run-alpine                   boot Alpine (a package manager in the guest)
 #   make run NET='user,hostfwd=tcp::8080-:80'   boot with a host port forwarded in
 #   make test                         boot, run shell checks, power off (headless)
@@ -21,8 +23,8 @@ MEM     ?= 128
 IMAGE   ?= Image
 NET     ?= user
 
-.PHONY: busybox rootfs kernel alpine run run-disk run-alpine test test-net \
-	test-slirp test-persist
+.PHONY: busybox rootfs kernel alpine apk run run-disk run-alpine test test-net \
+	test-slirp test-persist test-launcher
 
 busybox: busybox.static
 busybox.static:
@@ -38,6 +40,11 @@ kernel:
 alpine: alpine.img
 alpine.img: tools/mkalpine.py tools/mkrootfs.py
 	$(PYTHON) tools/mkalpine.py --ext4 $@ --size 512
+
+# Installing inside the guest takes minutes; doing it out here takes seconds.
+apk: alpine.img
+	@test -n "$(PKG)" || { echo 'usage: make apk PKG="htop jq"'; exit 1; }
+	$(PYTHON) tools/mkalpine.py --into alpine.img $(patsubst %,--pkg %,$(PKG))
 
 run: $(IMAGE) rootfs.cpio
 	$(PYTHON) -m pyvm -k $(IMAGE) -i rootfs.cpio -m $(MEM) --net $(NET)
@@ -59,3 +66,6 @@ test-slirp:
 
 test-persist: $(IMAGE) disk.img
 	$(PYTHON) tests/persist.py --kernel $(IMAGE) --disk disk.img --mem $(MEM)
+
+test-launcher:
+	$(PYTHON) tests/test_launcher.py

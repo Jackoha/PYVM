@@ -24,6 +24,9 @@ def parse_args(argv):
     p.add_argument('-m', '--mem', type=int, default=128, help='RAM size in MiB (default 128)')
     p.add_argument('--dtb', help='use this device tree blob instead of the generated one')
     p.add_argument('--dump-dtb', metavar='FILE', help='write the generated device tree and exit')
+    p.add_argument('-M', '--menu', action='store_true',
+                   help='choose kernel, root filesystem and options from a menu first '
+                        '(the default when run with no arguments on a terminal)')
     p.add_argument('-n', '--net', default='user', metavar='SPEC',
                    help='network backend: user[,OPT=VAL...], tap[,...] or none '
                         '(default: user); see below')
@@ -69,8 +72,38 @@ def read(path):
         return f.read()
 
 
+def pick_from_menu(argv):
+    """Resolve the boot menu into an argument list, or None if it was cancelled.
+
+    Arguments given alongside --menu are kept and placed after the menu's own,
+    so they still win -- `--menu -m 512` boots the menu's choice with 512 MiB."""
+    rest = [x for x in argv if x not in ('--menu', '-M')]
+    asked = len(rest) != len(argv)
+    if not asked and rest:
+        return rest
+    if not asked and not interactive():
+        return rest                     # no menu without a terminal: let argparse complain
+    from .launcher import choose
+    picked = choose('.')
+    if picked is None:
+        return None
+    return picked + rest
+
+
+def interactive():
+    try:
+        return sys.stdin.isatty() and sys.stderr.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
 def main(argv=None):
-    a = parse_args(sys.argv[1:] if argv is None else argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    argv = pick_from_menu(argv)
+    if argv is None:
+        sys.stderr.write('pyvm: cancelled\n')
+        return 0
+    a = parse_args(argv)
     console = Console()
     code = 1
     m = None

@@ -149,6 +149,49 @@ directory already has it applied.
 
 **Prebuilt Image:** just pass it with `-k`.
 
+## The boot menu
+
+Run pyvm with no arguments on a terminal and it asks what to boot instead of
+printing a usage error:
+
+```sh
+python3 -m pyvm          # or: ./run.sh --menu,  or: python3 -m pyvm --menu
+```
+
+```
+pyvm  --  RISC-V RV64GC virtual machine in Python
+
+ Kernel              Image                  Linux 6.1.74 #3 Oct  5, 4M
+ Root filesystem     alpine.img             Alpine 3.20.10, ext4 disk, 512M  --  disk: ...
+ Memory              256 MiB                256 MiB of guest RAM
+ Network             user                   NAT gateway in Python, no privileges needed
+ Disk read-only      off
+ Real time           on
+ Print stats         off
+ Kernel cmdline      (default)
+ Capture to pcap     (off)
+ Stop after N insns  (no limit)
+
+ python3 -m pyvm -k ./Image -d ./alpine.img -m 256 --net user
+ ↑↓ move   ←→ change   enter boot   e edit   s save   q quit
+```
+
+It finds the kernels and root filesystems in the directory and says what each
+one is: the **Linux version and build date** read out of every kernel image, and
+the **distribution** read out of every disk image, so picking a version is a
+matter of arrowing through them. The line above the keys is the command the menu
+stands for, so the flags stay discoverable rather than being hidden behind a UI.
+
+Choices are remembered in `.pyvm-launcher.json`, along with the probe results so
+the menu opens instantly next time. Arguments given with `--menu` still win, so
+`python3 -m pyvm --menu -m 512` boots the menu's choice with different memory.
+Anything that would stop the guest booting -- no kernel, a nonsense instruction
+limit -- is refused with a reason instead of failing after the screen clears.
+
+With arguments, or when stdin is not a terminal, pyvm behaves exactly as before,
+so scripts and the test suite are unaffected. `tests/test_launcher.py` covers
+the menu without needing a terminal.
+
 ## Keeping your files
 
 pyvm can boot two different roots, and they behave very differently:
@@ -232,9 +275,11 @@ built for riscv64. Because the image is an ext4 disk, anything you install
 #### `apk` is slow, and interrupting it causes a confusing error
 
 Installing a package takes **minutes**, not seconds: `apk add sl` measured 367 s,
-`apk update` 416 s. Pass `--no-progress`, because the progress bar writes
-constantly to the emulated serial console and console I/O is one of the more
-expensive things this VM does.
+`apk update` 416 s. Usually you should not do it in the guest at all --
+[install from the host](#install-from-the-host-not-inside-the-guest) instead,
+which takes seconds. If you do run it here, pass `--no-progress`, because the
+progress bar writes constantly to the emulated serial console and console I/O is
+one of the more expensive things this VM does.
 
 The trap is that `apk` looks hung, so you interrupt it and try again, and the
 first one has not finished letting go of its lock:
@@ -277,7 +322,36 @@ while the guest is still doing the maths, and curl then reporting
 succeeds. If you hit it, `-k` skips verification, `--cacert` with a trimmed
 bundle cuts the parsing cost, and plain HTTP is unaffected.
 
-### Baking packages into the image
+### Install from the host, not inside the guest
+
+`apk` works in the guest but it is painfully slow there -- measured on this
+machine, `apk add sl` took **367 seconds** and `apk update` **416**. Nothing is
+wrong; the VM simply runs at a few MIPS, and unpacking a package is real work.
+
+So do it out here instead. If a riscv64 user-mode emulator is installed
+(`qemu-user-static`, which also registers riscv64 with binfmt), `mkalpine.py`
+runs **the guest's own `apk`** on the host against the image's tree:
+
+```sh
+make apk PKG="htop ncdu"
+# or: python3 tools/mkalpine.py --into alpine.img --pkg htop --pkg ncdu
+```
+
+The same two packages that need minutes inside the VM install in **under three
+seconds**, and because it is really apk doing the work, apk's own database is
+updated -- the guest knows the packages are installed and will not fetch them
+again. Everything already in the image is kept: the image is read out, the
+packages are added, and it is rebuilt and checked before replacing the original,
+so an interrupted run cannot damage the disk you had.
+
+Two things to know. Post-install scripts are skipped, because apk runs them
+through `chroot()` and that needs privileges we do not have out here; run
+`apk fix` in the guest if a package turns out to need its script. And without
+`qemu-user-static` the tool falls back to unpacking `.apk` files itself, which
+works but leaves apk's database unaware of them -- `--unpack` forces that path
+if you want it.
+
+### Baking packages into a fresh image
 
 Installing inside the guest is slow — the VM runs at a few MIPS, so unpacking a
 large package takes a while. `tools/mkalpine.py` can instead unpack packages on
@@ -525,6 +599,7 @@ pyvm/
                  virtio.py      shared virtio-mmio v2 transport (registers, virtqueues)
                  virtio_blk.py  block device  -> /dev/vda
                  virtio_net.py  network device -> eth0
+  launcher.py    the boot menu: finds images, reads their versions, builds argv
   net/           slirp.py  user-mode NAT gateway: ARP, DHCP, DNS, ICMP, UDP, TCP
                  tap.py    host TAP device
                  frame.py  Ethernet/ARP/IPv4/ICMP/UDP/TCP headers and checksums
@@ -539,7 +614,7 @@ tools/
   mkalpine.py     build an Alpine riscv64 root filesystem with apk and curl,
                   resolving .apk dependencies from APKINDEX itself
 tests/            riscv-tests runner, Linux boot test, network stack test,
-                  disk persistence test
+                  disk persistence test, boot menu test
 ```
 
 ## Limitations

@@ -24,3 +24,4 @@ __pycache__/
 # Editors / OS
 *.swp
 .DS_Store
+/.pyvm-launcher.json
