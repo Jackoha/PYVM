@@ -7,6 +7,10 @@ each kernel and the distribution out of each disk image, and hands the choice
 back to the command line parser as an ordinary argument list -- the flags stay
 the single source of truth, the menu is only a front end for them.
 
+`g` fetches another Linux version: the menu steps out of curses, asks
+tools/get_kernel.py what kernel.org is publishing, downloads and builds the
+version chosen, and comes back with the new image selected.
+
 Probing an image costs a `debugfs` call, so results are cached in
 `.pyvm-launcher.json` next to the images, together with the last choice made.
 """
@@ -17,6 +21,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import time
 
 CONFIG = '.pyvm-launcher.json'
@@ -196,6 +201,87 @@ def discover(root='.'):
     return kernels, roots
 
 
+# ------------------------------------------------------------- fetching kernels
+def _tool(name):
+    """A script in the project's tools/ directory, next to this package."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(here, 'tools', name)
+
+
+def kernel_versions(root='.', timeout=180):
+    """What kernel.org is publishing, via tools/get_kernel.py.  -> (rows, error)."""
+    try:
+        p = subprocess.run([sys.executable, _tool('get_kernel.py'),
+                            '--list', '--json', '--root', root],
+                           capture_output=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return [], str(e)
+    if p.returncode != 0:
+        err = p.stderr.decode('utf-8', 'replace').strip().splitlines()
+        return [], err[0] if err else 'tools/get_kernel.py failed'
+    try:
+        return json.loads(p.stdout.decode('utf-8', 'replace')), None
+    except ValueError:
+        return [], 'tools/get_kernel.py printed something unexpected'
+
+
+def get_kernel(root='.'):
+    """Choose a Linux version, download and build it.  -> (image path, message).
+
+    This runs on the real terminal rather than inside the menu: fetching
+    ~140 MB and building a kernel takes minutes and prints a great deal, and
+    none of that belongs in a curses window.
+    """
+    if not os.path.exists(_tool('get_kernel.py')):
+        return None, 'tools/get_kernel.py is missing'
+    print('\n  Asking kernel.org which versions it has...')
+    rows, err = kernel_versions(root)
+    if err:
+        return None, 'kernel.org: %s' % err
+    usable = [r for r in rows if r.get('usable')]
+    if not usable:
+        return None, 'kernel.org listed no installable version'
+    print('\n  Linux versions kernel.org is publishing:\n')
+    for i, r in enumerate(usable, 1):
+        notes = ' '.join(x for x in ('(end of life)' if r['eol'] else '',
+                                     '(built here already)' if r['installed'] else '')
+                         if x)
+        print('    %2d) %-12s %-10s %-11s %s'
+              % (i, r['version'], r['moniker'], r['date'], notes))
+    print('\n  Any other released version works too -- just type it in.')
+    try:
+        answer = input('\n  number, version, or Enter to go back: ').strip()
+    except (EOFError, KeyboardInterrupt):
+        return None, 'cancelled'
+    if not answer:
+        return None, ''
+    if answer.isdigit() and 1 <= int(answer) <= len(usable):
+        version = usable[int(answer) - 1]['version']
+    else:
+        version = answer.lstrip('vV')
+    print()
+    try:
+        r = subprocess.run([sys.executable, _tool('get_kernel.py'), version,
+                            '--root', root])
+    except KeyboardInterrupt:
+        return None, 'interrupted'
+    if r.returncode != 0:
+        _pause('  Linux %s was not built -- the output above says why.' % version)
+        return None, 'could not build Linux %s' % version
+    image = os.path.join(root, 'Image-%s' % version)
+    if not os.path.exists(image):
+        return None, 'the build finished but %s is not there' % os.path.basename(image)
+    _pause('  Linux %s is ready.' % version)
+    return image, 'Linux %s built, and selected above' % version
+
+
+def _pause(text):
+    try:
+        input('\n%s  Press Enter to go back to the menu. ' % text)
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 # ---------------------------------------------------------------- settings model
 class Field:
     """One row of the menu.  `key` names it in the saved configuration."""
@@ -291,7 +377,7 @@ class Line(Field):
 
 
 # ---------------------------------------------------------------- the menu
-KEYS = ' ↑↓ move   ←→ change   enter boot   e edit   s save   q quit '
+KEYS = ' ↑↓ move   ←→ change   enter boot   e edit   g get kernel   s save   q quit '
 
 
 class Menu:
@@ -299,14 +385,15 @@ class Menu:
         self.root = root
         self.probe = probe or Probe(root)
         kernels, roots = discover(root)
-        kopts = [(k, self.probe.describe(k, kernel=True)) for k in kernels]
+        kopts = self.kernel_options(kernels)
         ropts = [(None, 'no root filesystem (the kernel will panic)')]
         for path, kind in roots:
             tag = 'initramfs, in RAM: changes are lost' if kind == 'initrd' \
                 else 'disk: changes are saved'
             ropts.append(((path, kind), '%s  --  %s' % (self.probe.describe(path), tag)))
         self.fields = [
-            Pick('kernel', 'Kernel', kopts, help='which kernel image to boot'),
+            Pick('kernel', 'Kernel', kopts,
+                 help='which kernel image to boot -- g fetches another version'),
             Pick('root', 'Root filesystem', ropts, index=1 if len(ropts) > 1 else 0,
                  help='initramfs lives in RAM; a disk image keeps your changes'),
             Pick('mem', 'Memory', [(m, '%d MiB of guest RAM' % m) for m in MEM_CHOICES],
@@ -328,6 +415,20 @@ class Menu:
         self.cursor = 0
         self.message = ''
         self.restore(self.probe.last())
+
+    # ------------------------------------------------------------ images
+    def kernel_options(self, kernels=None):
+        if kernels is None:
+            kernels = discover(self.root)[0]
+        return [(k, self.probe.describe(k, kernel=True)) for k in kernels]
+
+    def rescan(self, select=None):
+        """Pick up images that appeared since the menu opened."""
+        f = self.by_key['kernel']
+        f.options = self.kernel_options()
+        f.index = 0
+        if select:
+            f.load(select)
 
     # ------------------------------------------------------------ persistence
     def restore(self, saved):
@@ -375,7 +476,7 @@ class Menu:
         """Anything that would stop this configuration from booting."""
         bad = []
         if not self.by_key['kernel'].value:
-            bad.append('no kernel found -- build one with tools/build_linux.sh')
+            bad.append('no kernel found -- press g to fetch one from kernel.org')
         if not self.by_key['root'].value:
             bad.append('no root filesystem chosen: the kernel will panic')
         limit = self.by_key['limit'].value.strip()
@@ -413,6 +514,25 @@ def _edit(win, y, x, width, value):
                 buf.append(chr(c))
     finally:
         curses.curs_set(0)
+
+
+def _shell_out(win, fn):
+    """Hand the terminal back, run fn on it, then restore the menu."""
+    import curses
+    try:
+        curses.def_prog_mode()
+        curses.endwin()
+    except curses.error:
+        pass                          # not a real screen: nothing to hand back
+    try:
+        return fn()
+    finally:
+        try:
+            curses.reset_prog_mode()
+        except curses.error:
+            pass
+        win.clearok(True)
+        win.refresh()
 
 
 def _pair(n):
@@ -495,6 +615,11 @@ def _loop(win, menu):
                 continue
             menu.probe.save(menu.snapshot())
             return menu.argv()
+        elif c in (ord('g'), ord('G')):
+            image, note = _shell_out(win, lambda: get_kernel(menu.root))
+            if image:
+                menu.rescan(select=image)
+            menu.message = note
         elif c == ord('s'):
             menu.probe.save(menu.snapshot())
             menu.message = 'saved as the default for next time'
@@ -525,11 +650,19 @@ def text_menu(root='.'):
         for bad in menu.problems():
             print('  ! %s' % bad)
         try:
-            answer = input('\n  number to change, Enter to boot, q to quit: ').strip()
+            answer = input('\n  number to change, g for another kernel, '
+                           'Enter to boot, q to quit: ').strip()
         except (EOFError, KeyboardInterrupt):
             return None
         if answer.lower() in ('q', 'quit'):
             return None
+        if answer.lower() == 'g':
+            image, note = get_kernel(menu.root)
+            if image:
+                menu.rescan(select=image)
+            if note:
+                print('  %s' % note)
+            continue
         if not answer:
             if menu.problems():
                 continue

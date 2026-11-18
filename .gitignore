@@ -6,7 +6,7 @@
 # Built or downloaded artifacts. run.sh and the Makefile recreate every one of
 # these, so they do not belong in the history.
 /Image
-/Image-defconfig
+/Image-*
 /busybox.static
 /rootfs.cpio
 /rootfs.cpio.gz

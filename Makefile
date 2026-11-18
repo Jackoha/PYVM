@@ -4,6 +4,8 @@
 #   make busybox                      download a static riscv64 busybox
 #   make rootfs                       build rootfs.cpio (initramfs) and disk.img (ext4)
 #   make kernel LINUX=../linux-6.1.74 build Image from your Linux source tree
+#   make kernels                      list the Linux versions kernel.org offers
+#   make get-kernel VER=6.6.162       download that version -> Image-6.6.162
 #   make run                          boot Image + rootfs.cpio
 #   make run-disk                     boot Image with disk.img as the root filesystem
 #   make alpine                       build alpine.img (Alpine Linux: apk, curl)
@@ -25,8 +27,9 @@ MEM     ?= 128
 IMAGE   ?= Image
 NET     ?= user
 
-.PHONY: busybox rootfs kernel alpine apk run run-disk run-alpine test test-net \
-	test-slirp test-persist test-launcher test-applets boot-phases
+.PHONY: busybox rootfs kernel kernels get-kernel alpine apk \
+	run run-disk run-alpine \
+	test test-net test-slirp test-persist test-launcher test-applets boot-phases
 
 busybox: busybox.static
 busybox.static:
@@ -45,6 +48,14 @@ disk.img:
 
 kernel:
 	tools/build_linux.sh $(LINUX) $(CONFIG) $(abspath $(IMAGE))
+
+# Fetch a kernel version from kernel.org and build it (also on `g` in the menu).
+kernels:
+	$(PYTHON) tools/get_kernel.py --list
+
+get-kernel:
+	@test -n "$(VER)" || { echo 'usage: make get-kernel VER=6.6.162'; exit 1; }
+	$(PYTHON) tools/get_kernel.py $(VER)
 
 alpine: alpine.img
 alpine.img: tools/mkalpine.py tools/mkrootfs.py

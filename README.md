@@ -84,7 +84,15 @@ Ctrl-C goes to the guest (the terminal is put into raw mode).
 
 pyvm boots the standard RISC-V **`arch/riscv/boot/Image`** (an ELF `vmlinux` works too).
 
-**From source (recommended):**
+**Let pyvm fetch one** (any released version -- see
+[Choosing a Linux version](#choosing-a-linux-version-and-fetching-it)):
+
+```sh
+python3 tools/get_kernel.py --list      # what kernel.org is publishing
+python3 tools/get_kernel.py 6.6.162     # download, verify, build -> ./Image-6.6.162
+```
+
+**From a source tree you already have:**
 
 ```sh
 tools/build_linux.sh /path/to/linux-6.1.74            # small config, fastest boot
@@ -173,7 +181,7 @@ pyvm  --  RISC-V RV64GC virtual machine in Python
  Stop after N insns  (no limit)
 
  python3 -m pyvm -k ./Image -d ./alpine.img -m 256 --net user
- ↑↓ move   ←→ change   enter boot   e edit   s save   q quit
+ ↑↓ move   ←→ change   enter boot   e edit   g get kernel   s save   q quit
 ```
 
 It finds the kernels and root filesystems in the directory and says what each
@@ -191,6 +199,83 @@ limit -- is refused with a reason instead of failing after the screen clears.
 With arguments, or when stdin is not a terminal, pyvm behaves exactly as before,
 so scripts and the test suite are unaffected. `tests/test_launcher.py` covers
 the menu without needing a terminal.
+
+### Choosing a Linux version, and fetching it
+
+Press **`g`** in the menu and it asks kernel.org what it is publishing, then
+downloads, verifies and builds the version you pick -- and comes back with the
+new image selected, ready to boot:
+
+```
+  Linux versions kernel.org is publishing:
+
+     1) 7.3.5        stable     2026-11-17
+     2) 7.2.15       stable     2026-11-01  (end of life)
+     3) 6.18.64      longterm   2026-11-17
+     4) 6.12.118     longterm   2026-11-17
+     5) 6.6.162      longterm   2026-11-06
+     6) 6.1.192      longterm   2026-11-06
+
+  Any other released version works too -- just type it in.
+
+  number, version, or Enter to go back: 5
+```
+
+The same thing from the command line:
+
+```sh
+python3 tools/get_kernel.py --list              # what kernel.org offers now
+python3 tools/get_kernel.py 6.6.162             # -> ./Image-6.6.162
+python3 tools/get_kernel.py 6.6.162 --fetch-only          # source only, no build
+python3 tools/get_kernel.py --installed         # kernels already built here
+make kernels                                    # the list
+make get-kernel VER=6.6.162                     # fetch and build one
+```
+
+Each step is skipped when its result is already there, so an interrupted
+download or a failed build costs nothing to retry:
+
+| step | result |
+|---|---|
+| download | `linux-<version>.tar.xz`, resumable, 16 connections at once |
+| verify | sha256 compared against kernel.org's signed `sha256sums.asc` |
+| extract | `linux-<version>/` |
+| build | `Image-<version>`, via `tools/build_linux.sh` and the same `linux/pyvm.config` |
+
+The image is named after its version, which is also how the menu can tell them
+apart -- it reads the `Linux version` banner out of each one, so after fetching
+a few you arrow through `Linux 6.1.74`, `Linux 6.6.162`, and so on.
+
+Two honest caveats:
+
+- **What the checksum proves.** `sha256sums.asc` is PGP-signed by kernel.org,
+  but comparing the sum against it only tells you the tarball matches what that
+  file says, over the same TLS connection that served the tarball. Add
+  `--verify-signature` for the real thing: it checks the PGP signature on the
+  tarball with `gpg`, and tells you plainly when it cannot (no gpg, or their
+  signing keys are not in your keyring).
+- **Release candidates are refused.** kernel.org publishes no checksum list
+  covering `-rc` tarballs or `linux-next`, and this script will not install
+  something it cannot check. Released versions only.
+
+A version pyvm has not been tried with may simply not build with the compiler
+you have, or may need changes to `linux/pyvm.config`; the build output says
+which, and nothing else is touched when it fails.
+
+**6.6.162 was fetched and booted this way** to check the whole path works
+(clang 18, the `linux/patches/` fix applied cleanly, all of
+`tests/boot_linux.py` passed, networking included). It is worth knowing that a
+newer kernel is not automatically a faster boot here:
+
+| | instructions to the prompt | wall | decoded pages |
+|---|---|---|---|
+| Linux 6.1.74 | 48.4 M | 15.0 s | 451 |
+| Linux 6.6.162 | **42.7 M** | **16.3 s** | 469 |
+
+6.6 gets there in 12% fewer instructions but takes 8% longer, so its
+instruction mix costs this interpreter more per instruction. The number of
+decoded pages is almost the same, so that is not a decode-cache effect; beyond
+that we have not pinned it down.
 
 ## Keeping your files
 

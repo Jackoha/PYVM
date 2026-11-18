@@ -55,6 +55,9 @@ class FakeWin:
     def move(self, y, x):
         pass
 
+    def clearok(self, flag):
+        pass
+
     def refresh(self):
         pass
 
@@ -179,6 +182,104 @@ def t_persist(cfg):
     if VERBOSE:
         print('   restored memory=%s stats=on cmdline=%r'
               % (again.by_key['mem'].show(), again.by_key['append'].value))
+
+
+# ------------------------------------------------------- fetching a kernel
+def fake_image(directory, version='9.9.9'):
+    """A file that `discover` will accept as a kernel image."""
+    path = os.path.join(directory, 'Image-%s' % version)
+    banner = ('Linux version %s (pyvm@test) (test) #1 Mon Jan 1 00:00:00 UTC 2024'
+              % version).encode()
+    with open(path, 'wb') as f:
+        f.write(b'\0' * 4096)
+        f.write(banner + b'\0')
+        f.write(b'\0' * (1 << 19))          # over discover()'s size floor
+    return path
+
+
+@test('rescan picks up a kernel that appeared while the menu was open')
+def t_rescan(cfg):
+    import tempfile
+    root = tempfile.mkdtemp(prefix='pyvm-test-')
+    try:
+        menu = launcher.Menu(root, probe=launcher.Probe(root, path=cfg))
+        assert not menu.by_key['kernel'].options, 'the empty directory offered a kernel'
+        assert menu.problems(), 'no kernel should be a problem'
+        assert 'press g' in menu.problems()[0], 'the problem should point at g'
+        path = fake_image(root)
+        menu.rescan(select=path)
+        f = menu.by_key['kernel']
+        assert f.value == path, 'rescan did not select %s (got %r)' % (path, f.value)
+        assert '9.9.9' in f.detail(menu), 'the version was not read: %r' % f.detail(menu)
+        if VERBOSE:
+            print('   %s -> %s' % (os.path.basename(path), f.detail(menu)))
+    finally:
+        import shutil
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@test('g fetches a kernel and selects it, without leaving the menu')
+def t_get_key(cfg):
+    import tempfile
+    root = tempfile.mkdtemp(prefix='pyvm-test-')
+    try:
+        menu = launcher.Menu(root, probe=launcher.Probe(root, path=cfg))
+        path = fake_image(root, '8.8.8')          # as if the build had just finished
+        calls = []
+        real = launcher.get_kernel
+        launcher.get_kernel = lambda r: (calls.append(r), (path, 'Linux 8.8.8 built'))[1]
+        try:
+            win = FakeWin(keys=[ord('g'), ord('q')])
+            assert launcher._loop(win, menu) is None, 'q should still cancel'
+        finally:
+            launcher.get_kernel = real
+        assert calls == [root], 'get_kernel was called with %r' % calls
+        assert menu.by_key['kernel'].value == path, 'the new kernel was not selected'
+        # the message is shown on the next redraw, then cleared by the keypress
+        # after it, so look at what was drawn rather than at menu.message
+        assert 'Linux 8.8.8 built' in win.text(), 'the result was never shown'
+        assert 'Image-8.8.8' in win.text(), 'the menu does not show the new kernel'
+    finally:
+        import shutil
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@test('a failing get_kernel.py is reported, not raised')
+def t_versions_fail(cfg):
+    import subprocess as sp
+    real = launcher.subprocess.run
+    launcher.subprocess.run = lambda *a, **k: sp.CompletedProcess(
+        a[0], 1, b'', b'get_kernel: cannot reach kernel.org\n')
+    try:
+        rows, err = launcher.kernel_versions('.')
+    finally:
+        launcher.subprocess.run = real
+    assert rows == [], 'rows should be empty, got %r' % rows
+    assert err and 'kernel.org' in err, 'unhelpful error %r' % err
+
+    launcher.subprocess.run = lambda *a, **k: sp.CompletedProcess(a[0], 0, b'not json', b'')
+    try:
+        rows, err = launcher.kernel_versions('.')
+    finally:
+        launcher.subprocess.run = real
+    assert rows == [] and err, 'bad JSON should be an error, got %r / %r' % (rows, err)
+
+
+@test('the release list from get_kernel.py is understood')
+def t_versions_ok(cfg):
+    import json as js
+    import subprocess as sp
+    rows = [{'version': '6.6.162', 'moniker': 'longterm', 'date': '2026-11-06',
+             'eol': False, 'usable': True, 'installed': False}]
+    real = launcher.subprocess.run
+    launcher.subprocess.run = lambda *a, **k: sp.CompletedProcess(
+        a[0], 0, js.dumps(rows).encode(), b'')
+    try:
+        got, err = launcher.kernel_versions('.')
+    finally:
+        launcher.subprocess.run = real
+    assert err is None, 'unexpected error %r' % err
+    assert got == rows, 'got %r' % got
 
 
 def main():
