@@ -8,8 +8,9 @@ back to the command line parser as an ordinary argument list -- the flags stay
 the single source of truth, the menu is only a front end for them.
 
 `g` fetches another Linux version: the menu steps out of curses, asks
-tools/get_kernel.py what kernel.org is publishing, downloads and builds the
-version chosen, and comes back with the new image selected.
+tools/get_kernel.py what kernel.org is publishing -- the current releases, or
+every release in a series you name -- then downloads and builds the version
+chosen and comes back with the new image selected.
 
 Probing an image costs a `debugfs` call, so results are cached in
 `.pyvm-launcher.json` next to the images, together with the last choice made.
@@ -208,21 +209,118 @@ def _tool(name):
     return os.path.join(here, 'tools', name)
 
 
-def kernel_versions(root='.', timeout=180):
-    """What kernel.org is publishing, via tools/get_kernel.py.  -> (rows, error)."""
+def _ask_get_kernel(args, root, timeout):
+    """Run tools/get_kernel.py for JSON.  -> (parsed, error)."""
     try:
-        p = subprocess.run([sys.executable, _tool('get_kernel.py'),
-                            '--list', '--json', '--root', root],
+        p = subprocess.run([sys.executable, _tool('get_kernel.py')] + args
+                           + ['--json', '--root', root],
                            capture_output=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as e:
-        return [], str(e)
+        return None, str(e)
     if p.returncode != 0:
         err = p.stderr.decode('utf-8', 'replace').strip().splitlines()
-        return [], err[0] if err else 'tools/get_kernel.py failed'
+        return None, err[0] if err else 'tools/get_kernel.py failed'
     try:
         return json.loads(p.stdout.decode('utf-8', 'replace')), None
     except ValueError:
-        return [], 'tools/get_kernel.py printed something unexpected'
+        return None, 'tools/get_kernel.py printed something unexpected'
+
+
+def kernel_versions(root='.', timeout=180):
+    """The releases kernel.org is publishing now.  -> (rows, error)."""
+    got, err = _ask_get_kernel(['--list'], root, timeout)
+    if err:
+        return [], err
+    return got.get('releases', []), None
+
+
+def kernel_series(spec, root='.', timeout=300):
+    """Every fetchable release in one series, newest first.  -> (list, error)."""
+    got, err = _ask_get_kernel(['--list', spec], root, timeout)
+    if err:
+        return [], err
+    return got.get('versions', []), None
+
+
+SERIES_RE = re.compile(r'\d+(\.\d+)?\Z')
+SERIES_LIMIT = 60          # a series can hold ~200 releases; show the newest
+
+
+def _ask(prompt):
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+
+def _series_of(version):
+    return '.'.join(version.split('.')[:2])
+
+
+def choose_in_series(spec, root='.'):
+    """List every fetchable release in a series and pick one.  -> version/None."""
+    print('\n  Asking kernel.org for every %s release...' % spec)
+    versions, err = kernel_series(spec, root)
+    if err:
+        print('  kernel.org: %s' % err)
+        return None
+    if not versions:
+        print('  kernel.org has no releases in %s' % spec)
+        return None
+    print('\n  Linux %s -- %d releases, newest first:\n' % (spec, len(versions)))
+    for i in range(0, min(len(versions), SERIES_LIMIT), 5):
+        print('  ' + '  '.join('%4d) %-8s' % (i + j + 1, v)
+                               for j, v in enumerate(versions[i:i + 5])).rstrip())
+    if len(versions) > SERIES_LIMIT:
+        print('        (and %d older, back to %s -- type the one you want)'
+              % (len(versions) - SERIES_LIMIT, versions[-1]))
+    while True:
+        answer = _ask('\n  number, version, or Enter to go back: ')
+        if not answer:
+            return None
+        if answer.isdigit() and 1 <= int(answer) <= len(versions):
+            return versions[int(answer) - 1]
+        if answer.lstrip('vV') in versions:
+            return answer.lstrip('vV')
+        print('  %r is not one of the %s releases above' % (answer, spec))
+
+
+def choose_version(root='.'):
+    """Ask which Linux version to fetch.  -> a version string, or None."""
+    print('\n  Asking kernel.org which versions it has...')
+    rows, err = kernel_versions(root)
+    if err:
+        print('  kernel.org: %s' % err)
+        return None
+    usable = [r for r in rows if r.get('usable')]
+    if not usable:
+        print('  kernel.org listed no installable version')
+        return None
+    print('\n  Linux versions kernel.org is publishing:\n')
+    for i, r in enumerate(usable, 1):
+        notes = ' '.join(x for x in ('(end of life)' if r['eol'] else '',
+                                     '(built here already)' if r['installed'] else '')
+                         if x)
+        print('    %2d) %-12s %-10s %-11s %s'
+              % (i, r['version'], r['moniker'], r['date'], notes))
+    series = sorted({_series_of(r['version']) for r in usable},
+                    key=lambda v: [int(x) for x in v.split('.')], reverse=True)
+    print('\n  Those are only the newest of each series.  Type a series to see'
+          '\n  every release in it: %s -- or an older one (6.4, 5.4, ...).'
+          % ', '.join(series))
+    while True:
+        answer = _ask('\n  number, version, series, or Enter to go back: ')
+        if not answer:
+            return None
+        if answer.isdigit() and 1 <= int(answer) <= len(usable):
+            return usable[int(answer) - 1]['version']
+        spec = answer.lstrip('vV')
+        if SERIES_RE.match(spec):              # 6.6 or 6: a series, not a release
+            picked = choose_in_series(spec, root)
+            if picked:
+                return picked
+            continue
+        return spec
 
 
 def get_kernel(root='.'):
@@ -234,31 +332,9 @@ def get_kernel(root='.'):
     """
     if not os.path.exists(_tool('get_kernel.py')):
         return None, 'tools/get_kernel.py is missing'
-    print('\n  Asking kernel.org which versions it has...')
-    rows, err = kernel_versions(root)
-    if err:
-        return None, 'kernel.org: %s' % err
-    usable = [r for r in rows if r.get('usable')]
-    if not usable:
-        return None, 'kernel.org listed no installable version'
-    print('\n  Linux versions kernel.org is publishing:\n')
-    for i, r in enumerate(usable, 1):
-        notes = ' '.join(x for x in ('(end of life)' if r['eol'] else '',
-                                     '(built here already)' if r['installed'] else '')
-                         if x)
-        print('    %2d) %-12s %-10s %-11s %s'
-              % (i, r['version'], r['moniker'], r['date'], notes))
-    print('\n  Any other released version works too -- just type it in.')
-    try:
-        answer = input('\n  number, version, or Enter to go back: ').strip()
-    except (EOFError, KeyboardInterrupt):
-        return None, 'cancelled'
-    if not answer:
+    version = choose_version(root)
+    if not version:
         return None, ''
-    if answer.isdigit() and 1 <= int(answer) <= len(usable):
-        version = usable[int(answer) - 1]['version']
-    else:
-        version = answer.lstrip('vV')
     print()
     try:
         r = subprocess.run([sys.executable, _tool('get_kernel.py'), version,

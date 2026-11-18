@@ -25,3 +25,4 @@ __pycache__/
 *.swp
 .DS_Store
 /.pyvm-launcher.json
+/.pyvm-kernels.json

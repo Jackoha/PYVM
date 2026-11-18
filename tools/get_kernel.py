@@ -2,6 +2,7 @@
 """Download a Linux kernel version from kernel.org and build an Image for pyvm.
 
     python3 tools/get_kernel.py --list              what kernel.org offers now
+    python3 tools/get_kernel.py --list 6.6          every 6.6 release, ~160 of them
     python3 tools/get_kernel.py 6.6.162             fetch, verify, build Image-6.6.162
     python3 tools/get_kernel.py 6.6.162 --fetch-only          stop after extracting
     python3 tools/get_kernel.py --installed         kernels already built here
@@ -17,9 +18,14 @@ interrupted download or a failed build costs nothing:
 The boot menu (`python3 -m pyvm`) drives this with `g`, so a new version can be
 fetched, built and booted without leaving it.
 
-Only released versions can be had this way.  Release candidates are published
-without a checksum list that covers them, and this script will not install
-something it cannot check.
+What counts as available is not guessed at: kernel.org publishes one
+`sha256sums.asc` per series directory listing every tarball in it, so a
+version is fetchable exactly when it appears there -- about 1100 in v5.x, 770
+in v6.x and 50 in v7.x at the time of writing.  That list is cached in
+`.pyvm-kernels.json` for a day, so browsing series costs one download.
+
+Release candidates are the exception: they are published without a checksum
+list that covers them, and this script will not install what it cannot check.
 """
 
 import argparse
@@ -31,6 +37,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -98,23 +105,87 @@ def releases():
     return out
 
 
-def published_sha256(version):
-    """The checksum kernel.org publishes for this tarball.
+TARBALL_LINE = re.compile(r'^([0-9a-f]{64})  linux-(\d+\.\d+(?:\.\d+)?)\.tar\.xz$',
+                          re.M)
+CACHE = '.pyvm-kernels.json'
+CACHE_MAX_AGE = 24 * 3600
 
-    sha256sums.asc is a PGP-signed list covering every file in the series
-    directory.  We read the sum out of it; `--verify-signature` additionally
-    checks the PGP signature on the tarball itself, which needs gpg and the
-    kernel.org signing keys.
+
+def version_key(version):
+    parts = [int(x) for x in version.split('.')]
+    return tuple(parts + [0] * (3 - len(parts)))
+
+
+def major_of(spec):
+    """'6.6' / '6' / '6.x' / '6.6.162' -> 6, the kernel.org directory number."""
+    head = spec.lstrip('vV').split('.')[0]
+    if not head.isdigit():
+        raise Fail('%r does not start with a kernel series number' % spec)
+    return int(head)
+
+
+def catalogue(major, root=None, refresh=False):
+    """{version: sha256} for every tarball kernel.org has in v<major>.x.
+
+    This is the honest answer to "which versions can I fetch": one is listed
+    here exactly when kernel.org publishes both the tarball and a checksum
+    for it.  sha256sums.asc is a PGP-signed list covering the whole series
+    directory, so one download describes every release in it.
+
+    Kept in .pyvm-kernels.json for a day.  A published checksum never
+    changes, so a cached one is as good as a fresh one; --no-cache forces the
+    download anyway.
     """
-    want = tarball(version)
-    text = fetch(url_of(version, 'sha256sums.asc'), timeout=120).decode('utf-8', 'replace')
-    for line in text.splitlines():
-        parts = line.split()
-        if len(parts) == 2 and parts[1] == want and re.fullmatch(r'[0-9a-f]{64}', parts[0]):
-            return parts[0]
-    raise Fail('kernel.org has no checksum for %s -- is %s a released version?\n'
-               '       (try --list; release candidates are not supported)'
-               % (want, version))
+    key = str(major)
+    path = os.path.join(root or HERE, CACHE)
+    store = {}
+    if not refresh:
+        try:
+            with open(path) as f:
+                store = json.load(f)
+        except (OSError, ValueError):
+            store = {}
+        got = store.get(key)
+        if got and time.time() - got.get('fetched', 0) < CACHE_MAX_AGE:
+            return got['versions'], 'the cached list'
+    url = '%s/v%d.x/sha256sums.asc' % (MIRROR, major)
+    text = fetch(url, timeout=180).decode('utf-8', 'replace')
+    versions = {v: h for h, v in TARBALL_LINE.findall(text)}
+    if not versions:
+        raise Fail('kernel.org has no release tarballs in v%d.x' % major)
+    store[key] = {'fetched': time.time(), 'versions': versions}
+    try:
+        with open(path, 'w') as f:
+            json.dump(store, f)
+    except OSError:
+        pass                        # a read-only directory is not worth failing over
+    return versions, 'kernel.org'
+
+
+def available(spec, root=None, refresh=False):
+    """Every fetchable version in a series ('6.6') or a whole major ('6').
+
+    -> (sorted versions newest first, where the list came from).
+    """
+    spec = re.sub(r'\.x\Z', '', spec.lstrip('vV'))
+    versions, source = catalogue(major_of(spec), root, refresh)
+    if '.' in spec:                 # a series: 6.6 means 6.6 itself and 6.6.*
+        want = [v for v in versions if v == spec or v.startswith(spec + '.')]
+    else:                           # a whole major: every 6.*
+        want = list(versions)
+    return sorted(want, key=version_key, reverse=True), source
+
+
+def published_sha256(version, root=None, refresh=False):
+    """The checksum kernel.org publishes for this tarball, and where we got it."""
+    versions, source = catalogue(major_of(version), root, refresh)
+    if version not in versions and source == 'cached':
+        versions, source = catalogue(major_of(version), root, refresh=True)
+    if version not in versions:
+        raise Fail('kernel.org has no checksum for %s -- is %s a released version?\n'
+                   '       (try --list %s; release candidates are not supported)'
+                   % (tarball(version), version, '.'.join(version.split('.')[:2])))
+    return versions[version], source
 
 
 # ---------------------------------------------------------------------- download
@@ -235,11 +306,11 @@ def verify_signature(version, tar_xz):
 
 
 # ------------------------------------------------------------------------ steps
-def ensure_tarball(version, root, want_sig=False):
+def ensure_tarball(version, root, want_sig=False, refresh=False):
     """Download and check linux-<version>.tar.xz.  -> its path."""
     path = os.path.join(root, tarball(version))
-    say('==> checksum from kernel.org')
-    want = published_sha256(version)
+    want, source = published_sha256(version, root, refresh)
+    say('==> checksum for %s (from %s)' % (tarball(version), source))
     if os.path.exists(path):
         say('==> %s is already here' % tarball(version))
         if sha256_of(path, progress=True) == want:
@@ -316,10 +387,45 @@ def release_rows(root):
     return rows
 
 
+def numbered(versions, limit=None, per_row=5, width=8):
+    """Lay versions out as numbered columns.  -> list of lines."""
+    shown = versions if limit is None else versions[:limit]
+    lines = []
+    for i in range(0, len(shown), per_row):
+        row = shown[i:i + per_row]
+        lines.append('  '.join('%4d) %-*s' % (i + j + 1, width, v)
+                               for j, v in enumerate(row)).rstrip())
+    if limit is not None and len(versions) > limit:
+        lines.append('        (and %d older, back to %s -- ask for any of them by name)'
+                     % (len(versions) - limit, versions[-1]))
+    return lines
+
+
+def print_series(spec, root, as_json=False, refresh=False):
+    """Every version kernel.org can give us in one series."""
+    versions, source = available(spec, root, refresh)
+    if as_json:
+        json.dump({'series': spec, 'source': source, 'versions': versions}, sys.stdout)
+        sys.stdout.write('\n')
+        return
+    if not versions:
+        raise Fail('kernel.org has no releases in %s -- try --list for the series '
+                   'it has' % spec)
+    here = {v for _, v in installed(root) if v}
+    say('Linux %s -- %d releases kernel.org can give you, newest first%s:\n'
+        % (spec, len(versions), '' if source == 'kernel.org' else ' (cached)'))
+    for line in numbered(versions):
+        say(line)
+    mine = sorted((v for v in here if v in versions), key=version_key, reverse=True)
+    if mine:
+        say('\n  already built here: %s' % ' '.join(mine))
+    say('\n  python3 tools/get_kernel.py %s' % versions[0])
+
+
 def print_list(root, as_json=False):
     rows = release_rows(root)
     if as_json:
-        json.dump(rows, sys.stdout)
+        json.dump({'releases': rows}, sys.stdout)
         sys.stdout.write('\n')
         return
     say('kernel.org, as of now:\n')
@@ -334,8 +440,12 @@ def print_list(root, as_json=False):
             notes.append('already built here')
         say('  %-10s %-14s %-11s %s'
               % (r['moniker'], r['version'], r['date'], '; '.join(notes)))
-    say('\n  python3 tools/get_kernel.py <version>     to fetch and build one')
-    say('  any released version works, not only the ones above')
+    series = sorted({'.'.join(r['version'].split('.')[:2]) for r in rows if r['usable']},
+                    key=version_key, reverse=True)
+    say('\n  python3 tools/get_kernel.py <version>     fetch and build one')
+    say('  python3 tools/get_kernel.py --list 6.6   every release in a series')
+    say('\n  Every released version is available, not only the ones above:')
+    say('  %s, or any older series (6.4, 5.4, ...).' % ', '.join(series))
 
 
 def print_installed(root):
@@ -353,10 +463,14 @@ def main(argv=None):
         prog='python3 tools/get_kernel.py', description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('version', nargs='?', help='a released kernel version, e.g. 6.6.162')
-    p.add_argument('--list', action='store_true', help='show what kernel.org offers')
+    p.add_argument('--list', nargs='?', const='', metavar='SERIES',
+                   help='show what kernel.org offers; with a series (--list 6.6) '
+                        'show every release in it')
     p.add_argument('--json', action='store_true',
-                   help='with --list, print the release list as JSON (the boot menu '
-                        'uses this)')
+                   help='with --list, print the list as JSON (the boot menu uses this)')
+    p.add_argument('--no-cache', action='store_true',
+                   help="re-read kernel.org's checksum list instead of the day-old "
+                        'copy in .pyvm-kernels.json')
     p.add_argument('--installed', action='store_true', help='show what is built here')
     p.add_argument('--fetch-only', action='store_true', help='download and extract, do not build')
     p.add_argument('--config', default='tiny', choices=('tiny', 'defconfig'),
@@ -368,8 +482,11 @@ def main(argv=None):
     p.add_argument('--root', default=HERE, help='where to keep sources and images')
     a = p.parse_args(argv)
 
-    if a.list:
-        print_list(a.root, a.json)
+    if a.list is not None:
+        if a.list:
+            print_series(a.list, a.root, a.json, a.no_cache)
+        else:
+            print_list(a.root, a.json)
         return 0
     if a.installed:
         print_installed(a.root)
@@ -382,7 +499,7 @@ def main(argv=None):
                    '       linux-next are not supported: kernel.org publishes no '
                    'checksum\n       list that covers them.' % a.version)
 
-    tar = ensure_tarball(version, a.root, want_sig=a.verify_signature)
+    tar = ensure_tarball(version, a.root, a.verify_signature, a.no_cache)
     src = ensure_source(version, a.root)
     if a.fetch_only:
         say('\nsource ready: %s' % src)
@@ -403,3 +520,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         sys.stderr.write('\ninterrupted\n')
         sys.exit(130)
+    except BrokenPipeError:
+        # piped into `head` and it has seen enough; say nothing about it
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)

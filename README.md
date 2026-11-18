@@ -213,18 +213,41 @@ new image selected, ready to boot:
      2) 7.2.15       stable     2026-11-01  (end of life)
      3) 6.18.64      longterm   2026-11-17
      4) 6.12.118     longterm   2026-11-17
-     5) 6.6.162      longterm   2026-11-06
+     5) 6.6.162      longterm   2026-11-06  (built here already)
      6) 6.1.192      longterm   2026-11-06
 
-  Any other released version works too -- just type it in.
+  Those are only the newest of each series.  Type a series to see
+  every release in it: 7.3, 7.2, 6.18, 6.12, 6.6, 6.1, 5.15, 5.10
+  -- or an older one (6.4, 5.4, ...).
 
-  number, version, or Enter to go back: 5
+  number, version, series, or Enter to go back: 6.6
 ```
+
+Naming a series lists everything in it, and any of those can be picked by
+number or by name:
+
+```
+  Linux 6.6 -- 163 releases, newest first:
+
+     1) 6.6.162      2) 6.6.161      3) 6.6.160      4) 6.6.159      5) 6.6.158
+     6) 6.6.157      7) 6.6.156      8) 6.6.155      9) 6.6.154     10) 6.6.153
+     ...
+        (and 103 older, back to 6.6 -- type the one you want)
+```
+
+**The list is not a guess.** kernel.org publishes one `sha256sums.asc` per
+series directory naming every tarball in it, so a version is listed exactly
+when it can be both downloaded and verified -- about **1100 in v5.x, 770 in
+v6.x and 50 in v7.x**. One download describes a whole series, and it is kept
+in `.pyvm-kernels.json` for a day (`--no-cache` re-reads it); a published
+checksum never changes, so a cached one is as good as a fresh one.
 
 The same thing from the command line:
 
 ```sh
 python3 tools/get_kernel.py --list              # what kernel.org offers now
+python3 tools/get_kernel.py --list 6.6          # every 6.6 release, 163 of them
+python3 tools/get_kernel.py --list 6            # every 6.x release, 767 of them
 python3 tools/get_kernel.py 6.6.162             # -> ./Image-6.6.162
 python3 tools/get_kernel.py 6.6.162 --fetch-only          # source only, no build
 python3 tools/get_kernel.py --installed         # kernels already built here

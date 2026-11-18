@@ -72,6 +72,20 @@ class FakeWin:
         return ''.join(self.grid[y]).rstrip()
 
 
+class quiet:
+    """Swallow what an interactive flow prints, unless -v was asked for."""
+
+    def __enter__(self):
+        import contextlib
+        import io
+        self.ctx = contextlib.redirect_stdout(sys.stdout if VERBOSE else io.StringIO())
+        self.ctx.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self.ctx.__exit__(*exc)
+
+
 def fresh_menu(tmpcfg):
     """A menu with no saved state, so tests do not depend on past runs."""
     return launcher.Menu('.', probe=launcher.Probe('.', path=tmpcfg))
@@ -273,13 +287,82 @@ def t_versions_ok(cfg):
              'eol': False, 'usable': True, 'installed': False}]
     real = launcher.subprocess.run
     launcher.subprocess.run = lambda *a, **k: sp.CompletedProcess(
-        a[0], 0, js.dumps(rows).encode(), b'')
+        a[0], 0, js.dumps({'releases': rows}).encode(), b'')
     try:
         got, err = launcher.kernel_versions('.')
     finally:
         launcher.subprocess.run = real
     assert err is None, 'unexpected error %r' % err
     assert got == rows, 'got %r' % got
+
+
+@test('a series listing is asked for and understood')
+def t_series(cfg):
+    import json as js
+    import subprocess as sp
+    versions = ['6.6.162', '6.6.161', '6.6.160', '6.6']
+    seen = []
+    real = launcher.subprocess.run
+
+    def fake(args, **kw):
+        seen.append(args)
+        return sp.CompletedProcess(
+            args, 0, js.dumps({'series': '6.6', 'versions': versions}).encode(), b'')
+
+    launcher.subprocess.run = fake
+    try:
+        got, err = launcher.kernel_series('6.6', '.')
+    finally:
+        launcher.subprocess.run = real
+    assert err is None, 'unexpected error %r' % err
+    assert got == versions, 'got %r' % got
+    assert '--list' in seen[0] and '6.6' in seen[0], 'asked for %r' % seen[0]
+
+
+@test('a series is browsed by number, by name, and left by Enter')
+def t_series_pick(cfg):
+    versions = ['6.6.162', '6.6.161', '6.6.160', '6.6']
+    real_series, real_input = launcher.kernel_series, launcher._ask
+    launcher.kernel_series = lambda spec, root='.', **k: (versions, None)
+    try:
+        with quiet():
+            # by number
+            answers = iter(['2'])
+            launcher._ask = lambda prompt: next(answers)
+            assert launcher.choose_in_series('6.6', '.') == '6.6.161'
+            # by name -- including the .0 release, past any display limit
+            answers = iter(['6.6'])
+            assert launcher.choose_in_series('6.6', '.') == '6.6'
+            # a wrong answer asks again rather than giving up
+            answers = iter(['nonsense', '1'])
+            assert launcher.choose_in_series('6.6', '.') == '6.6.162'
+            # Enter goes back
+            answers = iter([''])
+            assert launcher.choose_in_series('6.6', '.') is None
+    finally:
+        launcher.kernel_series, launcher._ask = real_series, real_input
+
+
+@test('typing a series at the top level opens that series')
+def t_series_from_top(cfg):
+    rows = [{'version': '6.6.162', 'moniker': 'longterm', 'date': '2026-11-06',
+             'eol': False, 'usable': True, 'installed': False}]
+    real = (launcher.kernel_versions, launcher.kernel_series, launcher._ask)
+    launcher.kernel_versions = lambda root='.', **k: (rows, None)
+    launcher.kernel_series = lambda spec, root='.', **k: (['6.1.192', '6.1.191'], None)
+    try:
+        with quiet():
+            answers = iter(['6.1', '2'])      # a series, then a number inside it
+            launcher._ask = lambda prompt: next(answers)
+            assert launcher.choose_version('.') == '6.1.191'
+            # a full version is taken as given, not treated as a series
+            answers = iter(['5.4.290'])
+            assert launcher.choose_version('.') == '5.4.290'
+            # and the numbered shortlist still works
+            answers = iter(['1'])
+            assert launcher.choose_version('.') == '6.6.162'
+    finally:
+        launcher.kernel_versions, launcher.kernel_series, launcher._ask = real
 
 
 def main():
