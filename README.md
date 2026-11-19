@@ -636,38 +636,115 @@ python3 -m pyvm [options]
   --bare ELF            run a bare-metal program in M-mode (riscv-tests, HTIF tohost)
   --no-realtime         deterministic time: skip idle periods instead of sleeping
   --max-insns N         stop after N instructions
-  --stats               print instruction count and speed at exit
+  --stats               print instruction count and speed at exit (and what the JIT did)
+  --no-jit              interpret only: never compile hot code (see Performance)
+  --jit-workers N       background processes compiling hot code (default: one per
+                        spare CPU, at most 2; 0 compiles inside the emulator)
+  --no-jit-cache        neither read nor write the compiled-code cache in ~/.cache/pyvm
 ```
 
 ## Performance
 
-Measured on one core of the development machine:
+pyvm runs guest code in two tiers. Code that has run only a few times is
+interpreted, one Python closure per instruction. Once code gets hot, its whole
+4 KiB page is compiled into a single Python function, a *region*, and from then
+on it runs as straight-line Python. On the CPython it was tuned for, the
+compiled code is about 3× faster on tight loops and 1.3–2.2× faster on
+everyday guest work.
 
-| Workload (Linux 6.1.74, busybox initramfs) | CPython 3.13 |
-|---|---|
-| tiny config (`tools/build_linux.sh`) → shell prompt | **~11 s** (~47 M instructions) |
-| the same, with `--net user` configured by DHCP | **~14 s** (the NIC costs nothing to boot) |
-| stock `defconfig` → shell prompt | ~33 s (~110 M instructions) |
-| average speed while booting | ~3.6–4.5 MIPS |
-| tight ALU loop | ~8 MIPS |
+Measured on a 4-core x86-64 VM with CPython 3.11, comparing the interpreter this
+work started from with the current code. "First run" starts with an empty
+compiled-code cache; "later runs" reuse it (see below):
+
+| Workload | before | first run | later runs |
+|---|---|---|---|
+| boot to shell prompt (tiny config, busybox initramfs) | 7.7 s | 6.7 s | **6.3 s** |
+| `seq 1 20000 \| awk '{s+=$1} END {print s}'` | 27.7 s | 21.3 s | **20.0 s** |
+| `md5sum` of 2 MiB | 4.6 s | 3.0 s | **2.7 s** |
+| `gzip -c` of 1 MiB | 8.0 s | 3.8 s | **3.6 s** |
+| `sha256sum` of 1 MiB | 11.1 s | 6.1 s | **5.2 s** |
+| shell loop, 3000 iterations | 8.4 s | 5.7 s | **5.4 s** |
+| `ls -lR /` | 45.5 s | 38.2 s | **35.8 s** |
+| Alpine: `apk update --no-progress` | 280 s | | **168 s** |
+| Alpine: `apk add --no-progress sl` | 220 s | | **144 s** |
+| Alpine: `curl https://dl-cdn.alpinelinux.org/` | 19.1 s | | **13.3 s** |
+| CPU-bound C program, bare metal (CRC, quicksort, memcpy, matrix) | 9.2 MIPS | | **26–28 MIPS** |
+
+The Alpine rows ran with the cache warm from earlier boots of the same kernel;
+apk itself was being compiled for the first time.
+
+Reproduce the guest rows with `python3 tests/bench_guest.py --kernel Image
+--initrd rootfs.cpio`. Add `--no-jit` for the interpreter alone, or
+`--no-jit-cache` for the first-run case.
 
 Networking is driven from the same loop as everything else: the backend's host
 sockets live on their own thread, the device is polled once per instruction
 batch, and an arriving packet wakes the hart out of `WFI` instead of waiting for
 the next timer tick, so round trips to the host cost about a millisecond.
 
-PyPy runs pyvm correctly but is only slightly faster (~5 MIPS), because the
-design is tuned for CPython.
+PyPy ran the interpreter correctly but was only slightly faster (~5 MIPS),
+because the design is tuned for CPython. The compiled tier has not been
+measured on PyPy.
 
-How it gets there:
+### How it gets there
+
+The interpreter (tier 0, and all of pyvm before the region compiler):
 - each instruction word is decoded **once** into a specialised Python closure;
-  closures are memoized by instruction bits and cached per physical page;
+  closures are memoized by instruction bits;
 - guest RAM is an `mmap` viewed through typed `memoryview`s, so aligned
   loads and stores are a single index operation;
 - data TLBs are dicts keyed per (privilege, SUM, MXR), so syscalls and
-  `copy_to_user` never flush them;
-- stores into pages holding decoded code take a slow path that invalidates only
-  the affected handlers, so self-modifying code and DMA stay coherent.
+  `copy_to_user` never flush them.
+
+The region compiler (`pyvm/jit.py`):
+- **Dispatch by block.** The run loop calls one entry per *block*, not per
+  instruction. A block is a straight run up to the first jump. Each entry
+  returns the next pc and how many instructions it ran. Every entry starts as
+  a tier-0 stub that runs the block's closures and counts how often it runs.
+- **Whole pages.** When an entry has run 32 times, its physical page is compiled
+  into a region. The region includes every entry that has run in the page, plus
+  every branch target, jump target and return address reachable from them
+  inside the page. Immediates become constants, the TLB hit path of every load
+  and store is inlined, and conditional branches become side exits or, when they
+  skip forward inside a block, plain `if`s. Moving to another entry in the page
+  is `o = target; continue` inside the function, with no trip back to the
+  dispatcher. A block that branches back to its own start becomes a `while`
+  loop with the guest registers in Python locals; the instruction budget is
+  still checked on every backward edge, so timers stay on time.
+- **Compiling off the main thread.** `compile()` costs about 100 µs per block.
+  That is as long as the interpreter takes to run a thousand instructions, and a
+  boot meets thousands of hot blocks. A region depends only on its page's bytes,
+  so worker processes (`pyvm/jitworker.py`, one per spare core, at most two)
+  build it while the guest keeps running in tier 0. They send the code back
+  marshalled.
+- **Kept between runs.** Finished regions are appended to
+  `~/.cache/pyvm/regions-<version>.bin`, keyed by a hash of the page's
+  contents. The next boot of the same kernel and programs starts compiled. The
+  cache is per pyvm version and Python version and is safe to delete;
+  `--no-jit-cache` turns it off and `PYVM_CACHE_DIR` moves it.
+- **Precise traps for free.** Every guest instruction gets its own source lines.
+  When a trap unwinds out of a region, the traceback's line number says which
+  instruction faulted and how many ran before it, and a loop's registers are
+  written back from the frame's locals. The fast path pays nothing for this.
+- **Coherent.** Pages holding code stay out of the write TLB, as before. A store
+  that lands on compiled code drops the whole region; DMA drops the page. A
+  region that arrives from a worker is installed only if the page's bytes still
+  match what it was built from.
+
+`--no-jit` turns the compiler off. `tests/test_jit.py` runs random programs both
+ways and checks they agree. riscv-tests pass with every block compiled on its
+first run, and booting Linux in lockstep with the interpreter (30 M
+instructions, comparing all registers every few hundred) shows no difference.
+
+Measured and dropped along the way:
+- keeping the guest registers in Python locals for every block, not just loops.
+  For the short blocks of real code, loading and writing back costs more than
+  it saves.
+- caching the last page translation in the region, to skip the TLB dict lookup.
+  Comparing page numbers costs about as much as the lookup does.
+- asking the host for huge pages for guest RAM. It made no difference with
+  transparent huge pages already on. Where defragmentation is `madvise`, it made
+  short-lived VMs slower.
 
 ### Where a boot's instructions go
 
@@ -748,6 +825,11 @@ python3 tests/test_applets.py
 
 # where a boot spends its instructions (use this to check an optimisation)
 python3 tests/boot_phases.py --kernel Image --initrd rootfs.cpio --repeat 2
+
+# the region compiler against the interpreter: random RV64GC programs (ALU,
+# loads/stores, branches, loops, calls, compressed, traps mid-block) run both
+# ways must leave identical registers and memory -- no toolchain or kernel needed
+python3 tests/test_jit.py           # 40/40 agree
 ```
 
 ## Source layout
@@ -756,6 +838,8 @@ python3 tests/boot_phases.py --kernel Image --initrd rootfs.cpio --repeat 2
 pyvm/
   cpu.py         hart state, CSRs, traps/interrupts, Sv39 MMU + TLBs, run loop
   decode.py      RV64GC decoder -> per-instruction closures (incl. compressed)
+  jit.py         region compiler: hot guest pages -> generated Python functions
+  jitworker.py   the background process jit.py hands compilation to
   fpu.py         exact IEEE-754 binary32/binary64 arithmetic for F/D
   sbi.py         built-in SBI firmware
   machine.py     board: RAM, bus, device tree, image loading, main loop, idle
@@ -780,7 +864,7 @@ tools/
   mkalpine.py     build an Alpine riscv64 root filesystem with apk and curl,
                   resolving .apk dependencies from APKINDEX itself
 tests/            riscv-tests runner, Linux boot test, network stack test,
-                  disk persistence test, boot menu test
+                  disk persistence test, boot menu test, JIT differential test
 ```
 
 ## Limitations
