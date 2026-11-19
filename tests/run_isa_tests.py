@@ -25,6 +25,8 @@ def run_one(path, max_insns):
         code = m.run(max_insns)
     except Exception as e:                      # emulator bug: report, keep going
         return 'crash: %s: %s' % (type(e).__name__, e)
+    finally:
+        m.close()
     if getattr(m, 'halt_reason', '') == 'instruction limit reached':
         return 'timeout'
     return 'ok' if code == 0 else 'fail (test #%d)' % code

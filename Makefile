@@ -18,6 +18,7 @@
 #   make test-slirp                   test the network stack alone (no kernel needed)
 #   make test-persist                 check the disk keeps files across a reboot
 #   make test-applets                 check busybox's applet table can be read
+#   make test-jit                     compiled code agrees with the interpreter (no kernel needed)
 #   make boot-phases                  where a boot spends its instructions
 
 PYTHON  ?= python3
@@ -29,7 +30,7 @@ NET     ?= user
 
 .PHONY: busybox rootfs kernel kernels get-kernel alpine apk \
 	run run-disk run-alpine \
-	test test-net test-slirp test-persist test-launcher test-applets boot-phases
+	test test-net test-slirp test-persist test-launcher test-applets test-jit boot-phases
 
 busybox: busybox.static
 busybox.static:
@@ -92,6 +93,9 @@ test-launcher:
 
 test-applets:
 	$(PYTHON) tests/test_applets.py
+
+test-jit:
+	$(PYTHON) tests/test_jit.py
 
 boot-phases: $(IMAGE) rootfs.cpio
 	$(PYTHON) tests/boot_phases.py --kernel $(IMAGE) --initrd rootfs.cpio \
