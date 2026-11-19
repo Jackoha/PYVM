@@ -2,10 +2,15 @@
 
 # pyvm — a RISC-V virtual machine in Python that boots Linux
 
-pyvm is a full-system emulator written in pure Python (no C extensions, no
-dependencies beyond the standard library). It emulates a 64-bit RISC-V board
-closely modelled on QEMU's `virt` machine, so a stock Linux kernel boots on it
-to a shell.
+pyvm is a full-system emulator written in Python (no dependencies beyond the
+standard library). It emulates a 64-bit RISC-V board closely modelled on QEMU's
+`virt` machine, so a stock Linux kernel boots on it to a shell.
+
+If the host has a C compiler, pyvm also builds a small C core
+(`pyvm/native/core.c`) the first time it runs and loads it with `ctypes`. The
+core runs the guest's common instructions about 20× faster: Linux boots to a
+shell in under a second. Everything else still runs in Python, and with no
+compiler (or `--no-native`) pyvm is pure Python, exactly as before.
 
 ## Architecture
 
@@ -382,8 +387,10 @@ built for riscv64. Because the image is an ext4 disk, anything you install
 
 #### `apk` is slow, and interrupting it causes a confusing error
 
-Installing a package takes **minutes**, not seconds: `apk add sl` measured 367 s,
-`apk update` 416 s. Usually you should not do it in the guest at all --
+Without the C core, installing a package takes **minutes**, not seconds: `apk add
+sl` measured 367 s and `apk update` 416 s. With the C core they take about 8 s
+and 12 s (see [Performance](#performance)), and the rest of this section matters
+much less. Usually you should not do it in the guest at all --
 [install from the host](#install-from-the-host-not-inside-the-guest) instead,
 which takes seconds. If you do run it here, pass `--no-progress`, because the
 progress bar writes constantly to the emulated serial console and console I/O is
@@ -432,11 +439,13 @@ bundle cuts the parsing cost, and plain HTTP is unaffected.
 
 ### Install from the host, not inside the guest
 
-`apk` works in the guest but it is painfully slow there -- measured on this
-machine, `apk add sl` took **367 seconds** and `apk update` **416**. Nothing is
-wrong; the VM simply runs at a few MIPS, and unpacking a package is real work.
+Without the C core, `apk` works in the guest but it is painfully slow there.
+Measured on this machine, `apk add sl` took **367 seconds** and `apk update`
+**416**. Nothing is wrong: the pure-Python VM runs at a few MIPS, and
+unpacking a package is real work. With the C core both take seconds, and
+installing inside the guest is fine.
 
-So do it out here instead. If a riscv64 user-mode emulator is installed
+Without it, do it out here instead. If a riscv64 user-mode emulator is installed
 (`qemu-user-static`, which also registers riscv64 with binfmt), `mkalpine.py`
 runs **the guest's own `apk`** on the host against the image's tree:
 
@@ -637,7 +646,8 @@ python3 -m pyvm [options]
   --no-realtime         deterministic time: skip idle periods instead of sleeping
   --max-insns N         stop after N instructions
   --stats               print instruction count and speed at exit (and what the JIT did)
-  --no-jit              interpret only: never compile hot code (see Performance)
+  --no-native           run everything in Python: do not build or use the C core
+  --no-jit              without the C core: interpret only, never compile hot code
   --jit-workers N       background processes compiling hot code (default: one per
                         spare CPU, at most 2; 0 compiles inside the emulator)
   --no-jit-cache        neither read nor write the compiled-code cache in ~/.cache/pyvm
@@ -645,46 +655,87 @@ python3 -m pyvm [options]
 
 ## Performance
 
-pyvm runs guest code in two tiers. Code that has run only a few times is
-interpreted, one Python closure per instruction. Once code gets hot, its whole
-4 KiB page is compiled into a single Python function, a *region*, and from then
-on it runs as straight-line Python. On the CPython it was tuned for, the
-compiled code is about 3× faster on tight loops and 1.3–2.2× faster on
-everyday guest work.
+Measured on a 4-core x86-64 VM with CPython 3.11. Three columns:
 
-Measured on a 4-core x86-64 VM with CPython 3.11, comparing the interpreter this
-work started from with the current code. "First run" starts with an empty
-compiled-code cache; "later runs" reuse it (see below):
+- **before**: the Python interpreter this work started from.
+- **pure Python**: `--no-native`, i.e. the interpreter plus the region compiler
+  described below, with its cache warm.
+- **C core**: the default when a C compiler is available.
 
-| Workload | before | first run | later runs |
+| Workload | before | pure Python | C core |
 |---|---|---|---|
-| boot to shell prompt (tiny config, busybox initramfs) | 7.7 s | 6.7 s | **6.3 s** |
-| `seq 1 20000 \| awk '{s+=$1} END {print s}'` | 27.7 s | 21.3 s | **20.0 s** |
-| `md5sum` of 2 MiB | 4.6 s | 3.0 s | **2.7 s** |
-| `gzip -c` of 1 MiB | 8.0 s | 3.8 s | **3.6 s** |
-| `sha256sum` of 1 MiB | 11.1 s | 6.1 s | **5.2 s** |
-| shell loop, 3000 iterations | 8.4 s | 5.7 s | **5.4 s** |
-| `ls -lR /` | 45.5 s | 38.2 s | **35.8 s** |
-| Alpine: `apk update --no-progress` | 280 s | | **168 s** |
-| Alpine: `apk add --no-progress sl` | 220 s | | **144 s** |
-| Alpine: `curl https://dl-cdn.alpinelinux.org/` | 19.1 s | | **13.3 s** |
-| CPU-bound C program, bare metal (CRC, quicksort, memcpy, matrix) | 9.2 MIPS | | **26–28 MIPS** |
+| boot to shell prompt (tiny config, busybox initramfs) | 7.7 s | 6.3 s | **0.35 s** |
+| `seq 1 20000 \| awk '{s+=$1} END {print s}'` | 27.7 s | 20.0 s | **1.2 s** |
+| `md5sum` of 2 MiB | 4.6 s | 2.7 s | **0.16 s** |
+| `gzip -c` of 1 MiB | 8.0 s | 3.6 s | **0.27 s** |
+| `sha256sum` of 1 MiB | 11.1 s | 5.2 s | **0.34 s** |
+| shell loop, 3000 iterations | 8.4 s | 5.4 s | **0.36 s** |
+| `ls -lR /` | 45.5 s | 35.8 s | **1.9 s** |
+| Alpine: boot to shell | 11.6 s | 8.1 s | **0.7 s** |
+| Alpine: `apk update --no-progress` | 280 s | 168 s | **11.9 s** |
+| Alpine: `apk add --no-progress sl` | 220 s | 144 s | **8.3 s** |
+| Alpine: `curl https://dl-cdn.alpinelinux.org/` | 19.1 s | 13.3 s | **1.4 s** |
+| CPU-bound C program, bare metal (CRC, quicksort, memcpy, matrix) | 9.2 MIPS | 26–28 MIPS | **~320 MIPS** |
 
-The Alpine rows ran with the cache warm from earlier boots of the same kernel;
-apk itself was being compiled for the first time.
+Reproduce the busybox rows with `python3 tests/bench_guest.py --kernel Image
+--initrd rootfs.cpio`. Add `--no-native` for pure Python, and `--no-jit` on top
+of that for the plain interpreter.
 
-Reproduce the guest rows with `python3 tests/bench_guest.py --kernel Image
---initrd rootfs.cpio`. Add `--no-jit` for the interpreter alone, or
-`--no-jit-cache` for the first-run case.
+### The C core
+
+`pyvm/native/core.c` (~1000 lines) is an RV64 interpreter. It covers:
+- RV64IMAC, F and D, and the Zicsr accesses the kernel makes all the time:
+  `sstatus`, the S-mode trap CSRs, `fcsr`, and the counters;
+- an Sv39 page walker with hardware A/D updates and a 4096-entry TLB;
+- S-mode exceptions (syscalls, page faults) and `sret`;
+- a cache of decoded instructions.
+
+Everything else is handed back one instruction at a time to the Python
+implementation, which stays the reference: M-mode traps and the SBI, MMIO
+devices, `wfi`, `sfence.vma`, page-crossing misaligned accesses, `RMM`
+rounding. Registers live in `ctypes` arrays that both sides use directly, so
+switching sides costs about a microsecond.
+
+Floating point runs on the host FPU with the guest's rounding mode, and the
+host's exception flags become `fflags`. The RISC-V rules the host does not
+follow are done by hand: canonical NaNs, saturating conversions, min/max,
+NaN-boxing and compare flags.
+
+The C core is checked against the Python code in three ways:
+- `tests/test_jit.py` runs random programs, including floating point on NaNs,
+  infinities, subnormals and every rounding mode, and requires identical
+  results;
+- all 244 riscv-tests pass;
+- a Linux boot run in lockstep with the Python interpreter (40 M instructions,
+  all registers compared every 128) shows no difference.
+
+The core is compiled once into `~/.cache/pyvm/core-<hash>.so` with `cc`
+(`$CC` if set), so its first use costs about a second. `--stats` says whether
+it is on, and if not, why.
+
+How fast is that next to a "real" VM? KVM cannot help: the guest is RISC-V and
+the host x86. QEMU translates guest code to host machine code and runs roughly
+1000+ MIPS on the same host. pyvm's core is still an interpreter, at 150–350
+MIPS, so it is a few times slower than QEMU but no longer in a different
+league. Closing the rest of that gap would take a binary translator.
+
+### Pure Python
+
+Without the C core, pyvm runs guest code in two tiers. Code that has run only a
+few times is interpreted, one Python closure per instruction. Once code gets
+hot, its whole 4 KiB page is compiled into a single Python function, a
+*region*, and from then on it runs as straight-line Python. That makes tight
+loops about 3× faster and everyday guest work 1.3–2.2× faster.
 
 Networking is driven from the same loop as everything else: the backend's host
 sockets live on their own thread, the device is polled once per instruction
 batch, and an arriving packet wakes the hart out of `WFI` instead of waiting for
 the next timer tick, so round trips to the host cost about a millisecond.
 
-PyPy ran the interpreter correctly but was only slightly faster (~5 MIPS),
-because the design is tuned for CPython. The compiled tier has not been
-measured on PyPy.
+PyPy runs the interpreter correctly; with `--no-jit` it booted to the prompt in
+10 s (PyPy 7.3.11). The region compiler is the wrong fit there: PyPy's own JIT
+copes badly with thousands of large generated functions, and booting took 20 s.
+Use CPython, ideally with the C core.
 
 ### How it gets there
 
@@ -826,9 +877,10 @@ python3 tests/test_applets.py
 # where a boot spends its instructions (use this to check an optimisation)
 python3 tests/boot_phases.py --kernel Image --initrd rootfs.cpio --repeat 2
 
-# the region compiler against the interpreter: random RV64GC programs (ALU,
-# loads/stores, branches, loops, calls, compressed, traps mid-block) run both
-# ways must leave identical registers and memory -- no toolchain or kernel needed
+# the region compiler and the C core against the interpreter: random RV64GC
+# programs (ALU, loads/stores, branches, loops, calls, compressed, F/D on awkward
+# values, traps mid-block) must leave identical registers, FP state and memory
+# -- no toolchain or kernel needed
 python3 tests/test_jit.py           # 40/40 agree
 ```
 
@@ -838,6 +890,8 @@ python3 tests/test_jit.py           # 40/40 agree
 pyvm/
   cpu.py         hart state, CSRs, traps/interrupts, Sv39 MMU + TLBs, run loop
   decode.py      RV64GC decoder -> per-instruction closures (incl. compressed)
+  native/        optional C core: core.c (RV64 interpreter, MMU, FPU) and the
+                 ctypes loader that compiles it on first use
   jit.py         region compiler: hot guest pages -> generated Python functions
   jitworker.py   the background process jit.py hands compilation to
   fpu.py         exact IEEE-754 binary32/binary64 arithmetic for F/D

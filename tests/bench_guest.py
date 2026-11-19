@@ -2,12 +2,13 @@
 """Time real work inside the guest: boot, then a few CPU-heavy shell commands.
 
     python tests/bench_guest.py --kernel Image --initrd rootfs.cpio
-    python tests/bench_guest.py --kernel Image --initrd rootfs.cpio --no-jit
+    python tests/bench_guest.py --kernel Image --initrd rootfs.cpio --no-native
 
 Each command's wall time is measured from typing it to its output appearing,
-the way a person at the console would see it.  --no-jit runs the interpreter
-alone, for comparison; --no-jit-cache starts without compiled code from earlier
-runs (the first run after installing or changing pyvm looks like that).
+the way a person at the console would see it.  By default the C core runs
+(when it can be built).  --no-native measures pure Python with the region
+compiler; add --no-jit for the plain interpreter, or --no-jit-cache for the
+compiler starting without code from earlier runs.
 """
 
 import argparse
@@ -18,7 +19,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
-from pyvm import jit                            # noqa: E402
+from pyvm import jit, native                    # noqa: E402
 from pyvm.console import BufferConsole          # noqa: E402
 from pyvm.machine import Machine                # noqa: E402
 
@@ -39,9 +40,12 @@ def main():
     ap.add_argument('--kernel', required=True)
     ap.add_argument('--initrd', required=True)
     ap.add_argument('--mem', type=int, default=128)
+    ap.add_argument('--no-native', action='store_true')
     ap.add_argument('--no-jit', action='store_true')
     ap.add_argument('--no-jit-cache', action='store_true')
     a = ap.parse_args()
+    if a.no_native:
+        native.ENABLED = False
     if a.no_jit:
         jit.ENABLED = False
     if a.no_jit_cache:
@@ -89,7 +93,9 @@ def main():
     th.join(5)
     total = 0.0
     ok = True
-    print('==== guest benchmark (%s)' % ('interpreter only' if a.no_jit else 'jit'))
+    mode = ('native core' if m.cpu.native is not None else
+            'interpreter only' if a.no_jit else 'Python region compiler')
+    print('==== guest benchmark (%s)' % mode)
     for cmd, dt, good in results:
         total += dt
         ok = ok and good

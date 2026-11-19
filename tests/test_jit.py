@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Differential test of the region compiler (pyvm/jit.py).
+"""Differential test of the region compiler (pyvm/jit.py) and the native
+core (pyvm/native).
 
 Generates random RV64GC programs -- ALU and M-extension operations, loads and
 stores of every width (some misaligned), forward branches, counted loops,
-calls, compressed instructions, and instructions that trap in the middle of a
-block (illegal instructions, ecall) -- and runs each one twice in M-mode: once
-with every entry compiled on its first run, once interpreted only.  Registers,
-memory and the number of traps taken must come out the same.
+calls, compressed instructions, F/D arithmetic on awkward values (NaNs,
+infinities, subnormals, all rounding modes), and instructions that trap in
+the middle of a block (illegal instructions, ecall) -- and runs each one in M-mode with the
+plain interpreter, with every entry compiled on its first run, and (when it can
+be built) with the native core.  Registers, memory and the number of traps
+taken must come out the same.
 
 No toolchain or kernel needed:
 
@@ -21,6 +24,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
+from pyvm import native                         # noqa: E402
 from pyvm.console import BufferConsole          # noqa: E402
 from pyvm.machine import Machine                # noqa: E402
 
@@ -184,6 +188,62 @@ def straight(p, rng, depth=0):
         p.emit(0x00000073)                                      # ecall: traps
 
 
+FP_PATTERNS = [0, 1 << 63, 0x3FF0000000000000, 0xBFF8000000000000, 0x7FF0000000000000,
+               0xFFF0000000000000, 0x7FF8000000000000, 0x7FF0000000000001, 0x7FEFFFFFFFFFFFFF,
+               0x0000000000000001, 0x0010000000000000, 0x3FB999999999999A, 0x43E0000000000000,
+               0x41DFFFFFFFE00000, 0xC3E0000000000000, 0x41F0000000000000,
+               0xFFFFFFFF3F800000, 0xFFFFFFFF7F800000, 0xFFFFFFFF7FC00000, 0xFFFFFFFF7F800001,
+               0xFFFFFFFF00000001, 0xFFFFFFFF80000000, 0xFFFFFFFF4F000000, 0xFFFFFFFFCF000000,
+               0xFFFFFFFF3DCCCCCD, 0x000000003F800000]
+
+
+def fp_value(p, rng, fd):
+    """Put an interesting bit pattern in f[fd] (via x31)."""
+    v = rng.choice(FP_PATTERNS) if rng.random() < .8 else rng.getrandbits(64)
+    li(p, 31, v)
+    p.emit(r_type(0x79, 0, 31, 0, fd, 0x53))                   # fmv.d.x
+
+
+def fp_op(p, rng):
+    fd, fa, fb, fc = (rng.randrange(32) for _ in range(4))
+    rd = rng.choice(FREE)
+    fmt = rng.randrange(2)
+    rm = rng.choice([0, 1, 2, 3, 4, 7, 7, 7])
+    k = rng.randrange(13)
+    if k < 4:                                                   # add sub mul div
+        p.emit(r_type((k << 2) | fmt, fb, fa, rm, fd, 0x53))
+    elif k == 4:                                                # sqrt
+        p.emit(r_type((0x0B << 2) | fmt, 0, fa, rm, fd, 0x53))
+    elif k == 5:                                                # sgnj*
+        p.emit(r_type((0x04 << 2) | fmt, fb, fa, rng.randrange(3), fd, 0x53))
+    elif k == 6:                                                # min/max
+        p.emit(r_type((0x05 << 2) | fmt, fb, fa, rng.randrange(2), fd, 0x53))
+    elif k == 7:                                                # fcvt.s.d / fcvt.d.s
+        p.emit(r_type((0x08 << 2) | fmt, 1 - fmt, fa, rm, fd, 0x53))
+    elif k == 8:                                                # compares -> x
+        p.emit(r_type((0x14 << 2) | fmt, fb, fa, rng.randrange(3), rd, 0x53))
+    elif k == 9:                                                # fcvt.{w,wu,l,lu}
+        p.emit(r_type((0x18 << 2) | fmt, rng.randrange(4), fa, rm, rd, 0x53))
+    elif k == 10:                                               # fcvt from integer
+        p.emit(r_type((0x1A << 2) | fmt, rng.randrange(4), rreg(rng), rm, fd, 0x53))
+    elif k == 11:                                               # fclass / fmv.x
+        p.emit(r_type((0x1C << 2) | fmt, 0, fa, rng.randrange(2), rd, 0x53))
+    else:                                                       # fused multiply-add
+        op = rng.choice([0x43, 0x47, 0x4B, 0x4F])
+        p.emit((fc << 27) | (fmt << 25) | (fb << 20) | (fa << 15) | (rm << 12) | (fd << 7) | op)
+
+
+def fp_block(p, rng):
+    for _ in range(rng.randrange(1, 4)):
+        fp_value(p, rng, rng.randrange(32))
+    if rng.random() < .3:
+        p.emit(i_type(0x002, rng.randrange(5), 5, 0, 0x73))   # csrwi frm, 0..4
+    for _ in range(rng.randrange(1, 6)):
+        fp_op(p, rng)
+    if rng.random() < .5:
+        p.emit(i_type(0x001, 0, 2, rng.choice(FREE), 0x73))   # csrr rd, fflags
+
+
 def compressed(p, rng):
     k = rng.randrange(9)
     rd = rng.choice(FREE)
@@ -261,7 +321,9 @@ def body(p, rng, n, depth, in_loop=False):
             forward_branch(p, rng, depth)
         elif k < 0.17 and depth == 0 and not in_loop:
             loop(p, rng, depth)
-        elif k < 0.20 and depth == 0:
+        elif k < 0.26 and FP and depth < 3:     # (depth 3: inside a short c.beqz)
+            fp_block(p, rng)
+        elif k < 0.29 and depth == 0:
             sub = rng.randrange(NSUBS)
             idx = len(p.items)
             p.emit(0)
@@ -271,6 +333,7 @@ def body(p, rng, n, depth, in_loop=False):
 
 
 NSUBS = 4
+FP = True
 
 
 def make_program(seed):
@@ -301,8 +364,13 @@ def handler():
     return p.assemble()
 
 
-def run(code, data_seed, compiled):
+def run(code, data_seed, mode):
+    """mode: 'interp', 'jit' or 'native'."""
+    native.ENABLED = mode == 'native'
+    compiled = mode == 'jit'
     m = Machine(BufferConsole(), mem_mb=16, realtime=False)
+    if mode == 'native' and m.cpu.native is None:
+        return None, 0
     jit = m.cpu.jit
     jit.use_worker = False
     jit.max_workers = 0
@@ -318,12 +386,14 @@ def run(code, data_seed, compiled):
     cpu.priv = 3
     cpu.pc = CODE
     cpu.mtvec = HANDLER
+    cpu.mstatus |= 3 << 13                                      # FPU on
     cpu.update_tlbs()
     m.htif = (TOHOST, None)
     m.run(2_000_000)
     reason = getattr(m, 'halt_reason', '')
     o = DATA - 4096 - RAM_BASE
-    return (reason, list(cpu.x[:32]), bytes(m.ram[o:o + 8192])), cpu.jit.compiled
+    return (reason, list(cpu.x[:32]), bytes(m.ram[o:o + 8192]),
+            list(cpu.f[:32]), cpu.fflags, cpu.frm), cpu.jit.compiled
 
 
 def main():
@@ -335,30 +405,44 @@ def main():
     seeds = [a.seed] if a.seed is not None else range(a.seeds)
     bad = 0
     regions = 0
+    natives = 0
     for seed in seeds:
         code, dseed = make_program(seed)
-        want, _ = run(code, dseed, False)
-        got, n = run(code, dseed, True)
+        want, _ = run(code, dseed, 'interp')
+        got, n = run(code, dseed, 'jit')
         regions += n
+        nat, _ = run(code, dseed, 'native')
+        if nat is not None and nat != want and got == want:
+            got, label = nat, 'native core'
+        else:
+            label = 'compiled'
+        natives += nat is not None
         if want[0] != 'htif exit':
             print('seed %d: interpreter did not finish (%s)' % (seed, want[0]))
             bad += 1
             continue
-        if got != want:
+        if got != want or (nat is not None and nat != want):
             bad += 1
-            print('seed %d: MISMATCH' % seed)
+            print('seed %d: MISMATCH (%s)' % (seed, label))
             if got[0] != want[0]:
-                print('  halt: compiled %r, interpreted %r' % (got[0], want[0]))
+                print('  halt: %s %r, interpreted %r' % (label, got[0], want[0]))
             for r in range(32):
                 if got[1][r] != want[1][r]:
-                    print('  x%d: compiled %#x, interpreted %#x' % (r, got[1][r], want[1][r]))
+                    print('  x%d: %s %#x, interpreted %#x' % (r, label, got[1][r], want[1][r]))
+            for r in range(32):
+                if got[3][r] != want[3][r]:
+                    print('  f%d: %s %#x, interpreted %#x' % (r, label, got[3][r], want[3][r]))
+            if got[4:] != want[4:]:
+                print('  fflags/frm: %s %s, interpreted %s' % (label, got[4:], want[4:]))
             if got[2] != want[2]:
                 diff = [i for i in range(len(got[2])) if got[2][i] != want[2][i]]
                 print('  memory differs at %d bytes, first at DATA%+d'
                       % (len(diff), diff[0] - 4096))
         elif a.verbose:
             print('seed %d: ok (%d bytes of code, %d traps)' % (seed, len(code), want[1][2]))
-    print('%d/%d programs agree (%d regions compiled)' % (len(seeds) - bad, len(seeds), regions))
+    print('%d/%d programs agree (%d regions compiled, native core %s)'
+          % (len(seeds) - bad, len(seeds), regions,
+             'checked' if natives else 'not available: %s' % native.error))
     return 1 if bad or not regions else 0
 
 
