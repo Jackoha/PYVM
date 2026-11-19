@@ -387,7 +387,9 @@ class JIT:
         self.compiled = 0           # regions installed
         self.failed = 0             # region builds that failed
         self.stub_code = None
-        self.hot = HOT if ENABLED else -1
+        # with the C core (pyvm/native) running the hart, this compiler is idle
+        on = ENABLED and getattr(cpu, 'native', None) is None
+        self.hot = HOT if on else -1
         # background compiler
         self.workers = []
         self.max_workers = WORKERS
@@ -400,7 +402,7 @@ class JIT:
         self.disk = {}
         self.disk_new = {}
         self.cache_path = None
-        if CACHE and ENABLED:
+        if CACHE and on:
             self.cache_path = cache_path()
             self.disk = load_cache(self.cache_path)
 

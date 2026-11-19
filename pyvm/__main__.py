@@ -5,6 +5,7 @@ import sys
 import time
 
 from . import jit
+from . import native
 from . import net as netbackend
 from .console import Console
 from .machine import Machine
@@ -41,8 +42,11 @@ def parse_args(argv):
                    help='deterministic time: idle periods are skipped instead of slept')
     p.add_argument('--max-insns', type=int, help='stop after this many instructions')
     p.add_argument('--stats', action='store_true', help='print instruction count and speed at exit')
+    p.add_argument('--no-native', action='store_true',
+                   help='do not use the C core (pyvm/native): run everything in Python')
     p.add_argument('--no-jit', action='store_true',
-                   help='interpret only: do not compile hot code into Python functions')
+                   help='without the C core: interpret only, do not compile hot code '
+                        'into Python functions')
     p.add_argument('--jit-workers', type=int, metavar='N',
                    help='background processes compiling hot code (default: one per '
                         'spare CPU, at most 2; 0 compiles in the emulator itself)')
@@ -113,6 +117,8 @@ def main(argv=None):
         sys.stderr.write('pyvm: cancelled\n')
         return 0
     a = parse_args(argv)
+    if a.no_native:
+        native.ENABLED = False
     if a.no_jit:
         jit.ENABLED = False
     if a.jit_workers is not None:
@@ -171,8 +177,12 @@ def main(argv=None):
         n = m.stats_insns
         sys.stderr.write('pyvm: %d instructions in %.1f s (%.2f MIPS)\n'
                          % (n, dt, n / dt / 1e6 if dt else 0))
+        if m.cpu.native is not None:
+            sys.stderr.write('pyvm: native core: on\n')
+        else:
+            sys.stderr.write('pyvm: native core: off (%s)\n' % native.error)
         j = m.cpu.jit
-        if j.hot > 0:
+        if j.hot > 0 and m.cpu.native is None:
             sys.stderr.write('pyvm: jit: %d regions installed, %d compiled code objects%s%s\n'
                              % (j.compiled, len(j.codes),
                                 ', %d builds failed' % j.failed if j.failed else '',

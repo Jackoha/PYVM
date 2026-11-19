@@ -19,6 +19,7 @@ Performance notes (this is the hot part of the VM):
 from .errors import Trap, Break, Refetch, VMError
 from . import decode as _decode
 from . import jit as _jit
+from . import native as _native
 
 M64 = (1 << 64) - 1
 RAM_BASE = 0x80000000
@@ -82,6 +83,22 @@ class CPU:
         self.m = machine
         self.x = [0] * 33          # x[32] is the junk sink for writes to x0
         self.f = [0] * 32
+        lib = _native.load()
+        self.native = lib
+        if lib is not None:
+            # the C core and the Python code share the register files
+            import ctypes
+            self.x = (ctypes.c_uint64 * 33)()
+            self.f = (ctypes.c_uint64 * 32)()
+            h = self._hart = _native.Hart()
+            self._ram_ref = ctypes.c_char.from_buffer(machine.ram)
+            h.ram = ctypes.addressof(self._ram_ref)
+            h.ram_size = machine.ram_size
+            h.x = ctypes.addressof(self.x)
+            h.f = ctypes.addressof(self.f)
+            h.reservation = M64
+            self._hp = ctypes.byref(h)
+            self.run_batch = self._run_native
         self.pc = 0
         self.priv = 3
         self.fflags = 0
@@ -176,6 +193,92 @@ class CPU:
         self.pc = pc
         return i
 
+    def _run_native(self, n):
+        """run_batch with the C core (pyvm/native): it runs instructions until
+        the budget is spent, a trap, or one it leaves to Python, which then
+        runs here, one at a time, through the ordinary decoder."""
+        h = self._hart
+        hp = self._hp
+        run = self.native.run
+        done = 0
+        h.mtime = self.mtime
+        h.instret = self.instret
+        h.mcounteren = self.mcounteren
+        h.scounteren = self.scounteren
+        h.mideleg = self.mideleg
+        while done < n:
+            priv = self.priv
+            h.pc = self.pc
+            h.priv = priv
+            h.mstatus = self.mstatus
+            h.satp = self.satp
+            h.mip = self.mip
+            h.mie = self.mie
+            h.medeleg = self.medeleg
+            h.stvec = self.stvec
+            h.sepc = self.sepc
+            h.scause = self.scause
+            h.stval = self.stval
+            h.sscratch = self.sscratch
+            h.fflags = self.fflags
+            h.frm = self.frm
+            run(hp, n - done)
+            done += h.count
+            # the C core takes S-mode traps, runs sret and some S-mode CSRs
+            self.pc = h.pc
+            old_st = self.mstatus
+            self.mstatus = h.mstatus
+            self.stvec = h.stvec
+            self.sepc = h.sepc
+            self.scause = h.scause
+            self.stval = h.stval
+            self.sscratch = h.sscratch
+            self.fflags = h.fflags
+            self.frm = h.frm
+            if h.priv != priv:
+                self.priv = h.priv
+                self.reservation = -1
+                self.update_tlbs()
+            elif (old_st ^ self.mstatus) & (SUM | MXR):
+                self.update_tlbs()
+            st = h.status
+            if st == 0:
+                break
+            if st == 1:
+                h.reservation = M64
+                self.trap(h.cause, h.tval, h.pc)
+                break
+            if st == 3:                         # an interrupt became ready
+                break
+            pc = self.pc
+            try:
+                self.pc = self.decode(self._fetch_insn(pc))(pc)
+                done += 1
+            except Break:
+                return done + 1
+            except Trap as t:
+                h.reservation = M64
+                self.trap(t.cause, t.tval, pc)
+                return done
+        return done
+
+    def _fetch_insn(self, pc):
+        """The instruction word at virtual address pc (may raise Trap)."""
+        pa, _ = self.translate(pc, 0)
+        o = pa - RAM_BASE
+        if o < 0 or o >= self.ram_size:
+            raise Trap(1, pc)
+        lo = self.mH[o >> 1]
+        if (lo & 3) != 3:
+            return lo
+        if (pc & 4095) == 4094:
+            pa, _ = self.translate((pc + 2) & M64, 0)
+            o2 = pa - RAM_BASE
+            if o2 < 0 or o2 >= self.ram_size:
+                raise Trap(1, (pc + 2) & M64)
+            return lo | (self.mH[o2 >> 1] << 16)
+        return lo | (self.mH[(o >> 1) + 1] << 16)
+
     def fetch_page(self, pc):
         pa, level = self.translate(pc, 0)
         o = pa - RAM_BASE
@@ -258,6 +361,8 @@ class CPU:
             self.set_tlb_cells(self.rtlb, d)
 
     def flush_tlb(self, va=None):
+        if self.native is not None:
+            self.native.flush(self._hp)
         if va is None:
             for d in self.tlb_sets.values():
                 d.clear()

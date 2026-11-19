@@ -26,6 +26,7 @@ from .errors import Halt, VMError
 
 TIMEBASE = 10_000_000       # timer ticks per second (guest time: 1 tick per instruction)
 BATCH = 4096                # instructions between device/interrupt polls
+NATIVE_BATCH = 1 << 16      # the same with the C core: ~0.3 ms of guest time
 MB = 1 << 20
 
 TEST_BASE, RTC_BASE, CLINT_BASE = 0x100000, 0x101000, 0x2000000
@@ -339,6 +340,7 @@ class Machine:
         clint = self.clint
         net = self.net
         jit = cpu.jit
+        batch = NATIVE_BATCH if cpu.native is not None else BATCH
         polls = 0
         executed = 0
         try:
@@ -348,7 +350,7 @@ class Machine:
                 else:
                     # stop the batch exactly when the next (future) timer event is due;
                     # an already-expired timer is pending in mip and needs no batch cut
-                    n = BATCH
+                    n = batch
                     now = cpu.mtime
                     d = cpu.stimecmp - now
                     if 0 < d < n:
