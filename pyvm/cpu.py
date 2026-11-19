@@ -8,14 +8,17 @@ Performance notes (this is the hot part of the VM):
   (effective privilege, SUM, MXR) combination, so switching U<->S or toggling
   SUM never needs a flush.  Only RAM pages are cached; MMIO always takes the
   slow path.
-* Instruction fetch goes through per-physical-page lists of decoded handlers.
-  Pages that hold decoded code are kept out of the write TLB, so any store to
-  them takes the slow path, which throws the decoded page away (self-modifying
-  code, page reuse, DMA ...).
+* Instruction fetch goes through a per-physical-page table of entry points
+  (CodePage.blocks): each runs a whole block or, once the page is hot, a whole
+  compiled region of it (jit.py), and returns (next pc, instructions run).
+  Pages that hold code are kept out of the write TLB, so any store to them
+  takes the slow path, which drops the code it overlaps (self-modifying code,
+  page reuse, DMA ...).
 """
 
 from .errors import Trap, Break, Refetch, VMError
 from . import decode as _decode
+from . import jit as _jit
 
 M64 = (1 << 64) - 1
 RAM_BASE = 0x80000000
@@ -51,6 +54,27 @@ CAUSE_NAMES = {
 ABI = ['zero', 'ra', 'sp', 'gp', 'tp', 't0', 't1', 't2', 's0', 's1', 'a0', 'a1', 'a2',
        'a3', 'a4', 'a5', 'a6', 'a7', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9',
        's10', 's11', 't3', 't4', 't5', 't6']
+
+
+class CodePage:
+    """A page of guest RAM that code has been fetched from.
+
+    blocks[off] is what the run loop calls to execute the code at page offset
+    off: `cold` until it first runs, then a tier-0 stub or the page's compiled
+    region (see jit.py).  The other fields belong to the JIT."""
+    __slots__ = ('ram', 'blocks', 'cold', 'ranges', 'region', 'hot', 'looked_up',
+                 'building', 'stores')
+
+    def __init__(self, ram, cold):
+        self.ram = ram              # the page's offset in guest RAM
+        self.blocks = [cold] * 4096
+        self.cold = cold
+        self.ranges = {}            # entry offset -> end offset, for invalidation
+        self.region = None          # (entry offsets, function) once compiled
+        self.hot = set()            # entries that got hot since the last build
+        self.looked_up = False      # code caches consulted for this page
+        self.building = None        # id of the region build in flight
+        self.stores = 0             # slow-path stores seen (see CODE_STORE_LIMIT)
 
 
 class CPU:
@@ -101,40 +125,56 @@ class CPU:
 
         cpu = self
 
-        def refetch(pc):
+        def refetch(pc, budget=0):
             cpu.pc = pc
             raise Refetch()
         self.refetch_list = [refetch] * 4096
+        self.jit = _jit.JIT(self)
 
         self.csrs = self._build_csrs()
         self.decode = _decode.build(self)
+        set_cells = self.set_tlb_cells
+        set_jit = self.jit.set_tlbs
+
+        def set_tlb_cells(rtlb, wtlb):
+            set_cells(rtlb, wtlb)
+            set_jit(rtlb, wtlb)
+        self.set_tlb_cells = set_tlb_cells
         self.update_tlbs()
 
     # ------------------------------------------------------------------ run loop
     def run_batch(self, n):
-        """Execute up to n instructions.  Returns the number executed."""
+        """Execute about n instructions (a block may run a few past n).
+        Returns the number executed."""
         pc = self.pc
         itlb = self.itlb
         vpn = -1
-        page = None
+        blocks = None
         i = 0
         try:
-            for i in range(n):
+            while i < n:
                 if pc >> 12 != vpn:
                     page = itlb.get(pc >> 12)
                     if page is None:
                         page = self.fetch_page(pc)
+                    blocks = page.blocks
                     vpn = pc >> 12
-                pc = page[pc & 4095](pc)
+                pc, k = blocks[pc & 4095](pc, n - i)
+                i += k
         except Refetch:
             return i
-        except Break:
-            return i + 1
+        except Break as e:
+            k, _ = _jit.unwind(self.jit, self, e, pc)
+            return i + k + 1
         except Trap as t:
-            self.trap(t.cause, t.tval, pc)
-            return i
+            k, fpc = _jit.unwind(self.jit, self, t, pc)
+            self.trap(t.cause, t.tval, fpc)
+            return i + k
+        except BaseException as e:             # Halt, VMError, Ctrl-C: leave the
+            _, self.pc = _jit.unwind(self.jit, self, e, pc)   # state consistent
+            raise
         self.pc = pc
-        return n
+        return i
 
     def fetch_page(self, pc):
         pa, level = self.translate(pc, 0)
@@ -154,39 +194,37 @@ class CPU:
         return pg
 
     def new_code_page(self, rp):
-        """Decoded-handler list for RAM page rp: slot [pc & 4095] holds the
-        handler for the instruction at pc; slot 4096 holds the page's RAM offset.
-        Slots start out as a stub that decodes the instruction on first use."""
-        decode_fill = self.decode_fill
+        """The CodePage for RAM page rp, with every entry still cold."""
+        make_stub = self.jit.make_stub
 
-        def stub(pc):
-            return decode_fill(pc, pg)(pc)
-        pg = [stub] * 4096
-        pg += [rp << 12, stub, 0]       # 4096: RAM offset, 4097: stub, 4098: store count
+        def cold(pc, budget):
+            b = blocks[pc & 4095] = make_stub(pg, pc & 4095)
+            return b(pc, budget)
+        pg = CodePage(rp << 12, cold)
+        blocks = pg.blocks
         self.code_pages[rp] = pg
         return pg
 
-    def decode_fill(self, pc, page):
-        off = pc & 4095
-        o = page[4096] + off
+    def decode_at(self, pc, page):
+        """Handler for the instruction at pc, in `page`.  Not cached: used for
+        a 32-bit instruction that straddles the page end."""
+        o = page.ram + (pc & 4095)
         lo = self.mH[o >> 1]
         if (lo & 3) != 3:
-            h = self.decode(lo)
-        elif off == 4094:
-            # 32-bit instruction straddling a page boundary: never cached
+            return self.decode(lo)
+        if (pc & 4095) == 4094:
             pa, _ = self.translate((pc + 2) & M64, 0)
             o2 = pa - RAM_BASE
             if o2 < 0 or o2 >= self.ram_size:
                 raise Trap(1, (pc + 2) & M64)
             return self.decode(lo | (self.mH[o2 >> 1] << 16))
-        else:
-            h = self.decode(lo | (self.mH[(o >> 1) + 1] << 16))
-        page[off] = h
-        return h
+        return self.decode(lo | (self.mH[(o >> 1) + 1] << 16))
 
     def invalidate_code(self, rp):
         pg = self.code_pages.pop(rp)
-        pg[:4096] = self.refetch_list
+        pg.blocks[:] = self.refetch_list
+        pg.ranges.clear()
+        pg.region = None
         for d in self.itlbs:
             d.clear()
 
@@ -335,14 +373,12 @@ class CPU:
             rp = o >> 12
             pg = self.code_pages.get(rp)
             if pg is not None:
-                if pg[4098] < CODE_STORE_LIMIT:
+                if pg.stores < CODE_STORE_LIMIT:
                     # store into a page holding decoded code: forget only the
-                    # handlers overlapping the written bytes, keep the page
-                    pg[4098] += 1
-                    off = o & 4095
-                    stub = pg[4097]
-                    for k in range(max((off - 2) & ~1, 0), min(off + size, 4096), 2):
-                        pg[k] = stub
+                    # code overlapping the written bytes, keep the page
+                    pg.stores += 1
+                    if pg.ranges:
+                        self.jit.invalidate(pg, o & 4095, size)
                     self._write_ram(o, size, v)
                     return
                 self.invalidate_code(rp)    # page is mostly data now: demote it

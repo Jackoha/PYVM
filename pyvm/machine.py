@@ -71,7 +71,9 @@ class Machine:
         self.stats_insns = 0
 
     def close(self):
-        """Release the devices' host resources (disk file, network sockets)."""
+        """Release the devices' host resources (disk file, network sockets),
+        stop the background compiler and save its code cache."""
+        self.cpu.jit.close()
         for _, _, dev in self.mmio:
             close = getattr(dev, 'close', None)
             if close is not None:
@@ -336,6 +338,8 @@ class Machine:
         uart = self.uart
         clint = self.clint
         net = self.net
+        jit = cpu.jit
+        polls = 0
         executed = 0
         try:
             while True:
@@ -369,6 +373,10 @@ class Machine:
                     net.poll()
                 if con.buf:
                     con.flush()
+                if jit.inflight or jit.backlog:
+                    polls += 1
+                    if not polls & 7:
+                        jit.poll()
                 if cpu.mip & cpu.mie:
                     cpu.check_irq()
                 if self.htif is not None:
