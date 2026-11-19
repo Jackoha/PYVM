@@ -26,6 +26,7 @@ from .errors import Halt, VMError
 
 TIMEBASE = 10_000_000       # timer ticks per second (guest time: 1 tick per instruction)
 BATCH = 4096                # instructions between device/interrupt polls
+NATIVE_BATCH = 1 << 16      # the same with the C core: ~0.3 ms of guest time
 MB = 1 << 20
 
 TEST_BASE, RTC_BASE, CLINT_BASE = 0x100000, 0x101000, 0x2000000
@@ -71,7 +72,9 @@ class Machine:
         self.stats_insns = 0
 
     def close(self):
-        """Release the devices' host resources (disk file, network sockets)."""
+        """Release the devices' host resources (disk file, network sockets),
+        stop the background compiler and save its code cache."""
+        self.cpu.jit.close()
         for _, _, dev in self.mmio:
             close = getattr(dev, 'close', None)
             if close is not None:
@@ -336,6 +339,9 @@ class Machine:
         uart = self.uart
         clint = self.clint
         net = self.net
+        jit = cpu.jit
+        batch = NATIVE_BATCH if cpu.native is not None else BATCH
+        polls = 0
         executed = 0
         try:
             while True:
@@ -344,7 +350,7 @@ class Machine:
                 else:
                     # stop the batch exactly when the next (future) timer event is due;
                     # an already-expired timer is pending in mip and needs no batch cut
-                    n = BATCH
+                    n = batch
                     now = cpu.mtime
                     d = cpu.stimecmp - now
                     if 0 < d < n:
@@ -369,6 +375,10 @@ class Machine:
                     net.poll()
                 if con.buf:
                     con.flush()
+                if jit.inflight or jit.backlog:
+                    polls += 1
+                    if not polls & 7:
+                        jit.poll()
                 if cpu.mip & cpu.mie:
                     cpu.check_irq()
                 if self.htif is not None:
